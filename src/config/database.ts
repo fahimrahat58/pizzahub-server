@@ -13,9 +13,29 @@ if (!dbName) {
 }
 
 export const mongoClient = new MongoClient(uri);
+
 export const db = mongoClient.db(dbName);
 
-export const connectDB = async () => {
-  await mongoClient.connect();
-  console.log("MongoDB connected successfully");
+let isConnected = false;
+
+export const connectDB = async (): Promise<void> => {
+  if (isConnected) {
+    return;
+  }
+
+  try {
+    await mongoClient.connect();
+
+    await db.command({ ping: 1 });
+
+    isConnected = true;
+
+    console.log("MongoDB connected successfully");
+  } catch (error) {
+    isConnected = false;
+
+    console.error("MongoDB connection failed:", error);
+
+    throw error;
+  }
 };

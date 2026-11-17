@@ -1,6 +1,7 @@
 import "dotenv/config";
 
 import type { Request, Response, NextFunction } from "express";
+
 import { createRemoteJWKSet, jwtVerify } from "jose";
 
 import { db } from "../config/database.js";
@@ -29,7 +30,6 @@ export const verifyToken = async (
   try {
     const authorization = req.headers.authorization;
 
-    // Check Authorization header
     if (!authorization?.startsWith("Bearer ")) {
       return res.status(401).json({
         success: false,
@@ -46,7 +46,6 @@ export const verifyToken = async (
       });
     }
 
-    // Verify Better Auth JWT
     const { payload } = await jwtVerify(token, JWKS, {
       issuer: authURL,
       audience: authURL,
@@ -61,12 +60,12 @@ export const verifyToken = async (
       });
     }
 
-    // Always get the latest user information from MongoDB.
-    // This prevents stale role/block information from the JWT
-    // from being trusted.
-    const user = await db
-      .collection<AuthUser>("users")
-      .findOne({ _id: userId });
+    // Always read the latest user data from MongoDB.
+    // This ensures role/block status is not taken
+    // from potentially stale JWT data.
+    const user = await db.collection<AuthUser>("users").findOne({
+      _id: userId,
+    });
 
     if (!user) {
       return res.status(401).json({
@@ -75,7 +74,6 @@ export const verifyToken = async (
       });
     }
 
-    // Blocked users cannot access protected routes
     if (user.isBlocked === true) {
       return res.status(403).json({
         success: false,
@@ -83,7 +81,6 @@ export const verifyToken = async (
       });
     }
 
-    // Validate role from database
     const validRoles: UserRole[] = ["admin", "vendor", "customer"];
 
     if (!validRoles.includes(user.role)) {
@@ -93,7 +90,6 @@ export const verifyToken = async (
       });
     }
 
-    // Attach authenticated user to Express request
     req.user = {
       id: user._id,
       role: user.role,
