@@ -279,7 +279,14 @@ try {
     { $set: { role: "admin" } },
   );
   const otherVendor = await signUp("otherVendor", "vendor");
-  cleanupIds = [customer.id, vendor.id, adminCandidate.id, otherVendor.id];
+  const otherCustomer = await signUp("otherCustomer", "customer");
+  cleanupIds = [
+    customer.id,
+    vendor.id,
+    adminCandidate.id,
+    otherVendor.id,
+    otherCustomer.id,
+  ];
 
   for (const weakPassword of ["Ab1", "lowercase", "UPPERCASE"]) {
     const weak = await authRequestWithRateLimitRetry("weak", "/api/auth/sign-up/email", {
@@ -305,7 +312,7 @@ try {
   );
   pass("Vendor signup stores account details only and creates no restaurant");
 
-  for (const actor of ["customer", "vendor", "admin", "otherVendor"]) {
+  for (const actor of ["customer", "vendor", "admin", "otherVendor", "otherCustomer"]) {
     await fetchToken(actor);
   }
   pass("JWT tokens issued and accepted by the Express API");
@@ -1387,7 +1394,147 @@ try {
   await api("vendor", "PATCH", `/api/orders/${rejectable.order.id}/accept`, undefined, 409);
   pass("Order details enforce ownership and reject transitions return email status");
 
+  const advanceToDelivered = async (targetOrderId) => {
+    const steps = [
+      [`/api/orders/${targetOrderId}/accept`, undefined, "accepted"],
+      [`/api/orders/${targetOrderId}/status`, { status: "preparing" }, "preparing"],
+      [`/api/orders/${targetOrderId}/status`, { status: "out_for_delivery" }, "out_for_delivery"],
+      [`/api/orders/${targetOrderId}/status`, { status: "delivered" }, "delivered"],
+    ];
+    for (const [path, body, expectedStatus] of steps) {
+      const result = await api("vendor", "PATCH", path, body);
+      assert.equal(result.order.status, expectedStatus);
+    }
+  };
+
+  // 1. Identity is always derived from the authenticated user.
   await api(
+    "customer",
+    "POST",
+    "/api/reviews",
+    {
+      orderId: order.id,
+      menuItemId: itemIds[0],
+      rating: 5,
+      comment: "Spoofed customer identity",
+      customerId: otherCustomer.id,
+      customerName: "Spoofed Name",
+    },
+    400,
+  );
+  pass("1/11 Strict review DTO rejects client-supplied customer identity");
+
+  // 2. Only delivered orders are reviewable.
+  const pendingReviewOrder = await api(
+    "customer",
+    "POST",
+    "/api/orders",
+    { ...orderPayload, menuItemId: itemIds[2], quantity: 1 },
+    201,
+  );
+  await api(
+    "customer",
+    "POST",
+    "/api/reviews",
+    {
+      orderId: pendingReviewOrder.order.id,
+      menuItemId: itemIds[2],
+      rating: 5,
+      comment: "Pending order must not be reviewed",
+    },
+    400,
+  );
+  await api("vendor", "PATCH", `/api/orders/${pendingReviewOrder.order.id}/accept`);
+  await api(
+    "customer",
+    "POST",
+    "/api/reviews",
+    {
+      orderId: pendingReviewOrder.order.id,
+      menuItemId: itemIds[2],
+      rating: 5,
+      comment: "Accepted order must not be reviewed",
+    },
+    400,
+  );
+  await api("vendor", "PATCH", `/api/orders/${pendingReviewOrder.order.id}/status`, {
+    status: "preparing",
+  });
+  await api(
+    "customer",
+    "POST",
+    "/api/reviews",
+    {
+      orderId: pendingReviewOrder.order.id,
+      menuItemId: itemIds[2],
+      rating: 5,
+      comment: "Preparing order must not be reviewed",
+    },
+    400,
+  );
+  for (const [targetOrderId, targetItemId] of [
+    [rejectable.order.id, itemIds[1]],
+    [repeat.order.id, itemIds[0]],
+  ]) {
+    await api(
+      "customer",
+      "POST",
+      "/api/reviews",
+      {
+        orderId: targetOrderId,
+        menuItemId: targetItemId,
+        rating: 5,
+        comment: "Non-delivered order must not be reviewed",
+      },
+      400,
+    );
+  }
+  pass("2/11 Pending, accepted, preparing, rejected, and cancelled orders are rejected");
+
+  // 3. The submitted product must be the exact product on the order.
+  await api(
+    "customer",
+    "POST",
+    "/api/reviews",
+    {
+      orderId: order.id,
+      menuItemId: itemIds[1],
+      rating: 5,
+      comment: "This pizza was not in my order",
+    },
+    400,
+  );
+  pass("3/11 A product not present on the delivered order is rejected");
+
+  // 4. Customers can only review their own orders, and guests cannot review.
+  await api(
+    "otherCustomer",
+    "POST",
+    "/api/reviews",
+    {
+      orderId: order.id,
+      menuItemId: itemIds[0],
+      rating: 5,
+      comment: "Someone else's order",
+    },
+    400,
+  );
+  await api(
+    null,
+    "POST",
+    "/api/reviews",
+    {
+      orderId: order.id,
+      menuItemId: itemIds[0],
+      rating: 5,
+      comment: "Guest review attempt",
+    },
+    401,
+  );
+  pass("4/11 Cross-customer and unauthenticated review attempts are blocked");
+
+  // 5. A valid delivered review persists authenticated identity and timestamps.
+  const pizzaReview = await api(
     "customer",
     "POST",
     "/api/reviews",
@@ -1399,9 +1546,164 @@ try {
     },
     201,
   );
-  const reviews = await api(null, "GET", `/api/reviews/${itemIds[0]}`);
-  assert.ok(reviews.reviews.some((review) => review.comment === "Delicious integration pizza"));
-  pass("Customer can review a delivered pizza");
+  assert.equal(pizzaReview.review.customerId, customer.id);
+  assert.equal(pizzaReview.review.customerName, customer.name);
+  assert.equal(pizzaReview.review.menuItemId, itemIds[0]);
+  assert.equal(pizzaReview.review.orderId, order.id);
+  assert.ok(Date.parse(pizzaReview.review.createdAt));
+  assert.ok(Date.parse(pizzaReview.review.updatedAt));
+  const initialReviews = await api(null, "GET", `/api/reviews/${itemIds[0]}`);
+  assert.equal(initialReviews.reviews[0].customerId, undefined);
+  assert.equal(initialReviews.reviews[0].authorName, customer.name);
+  assert.equal(initialReviews.summary.ratingAvg, 5);
+  assert.equal(initialReviews.summary.reviewCount, 1);
+  assert.deepEqual(initialReviews.summary.ratingDistribution, {
+    "5": 1,
+    "4": 0,
+    "3": 0,
+    "2": 0,
+    "1": 0,
+  });
+  pass("5/11 Review stores auth identity and public ratings are server-computed");
+
+  // 6. One review per customer/product/order is enforced by the API and index.
+  await api(
+    "customer",
+    "POST",
+    "/api/reviews",
+    {
+      orderId: order.id,
+      menuItemId: itemIds[0],
+      rating: 4,
+      comment: "Duplicate pizza review attempt",
+    },
+    409,
+  );
+  pass("6/11 Duplicate product reviews for the same order are rejected");
+
+  // 7. The owner can edit, and every rating aggregate is recalculated.
+  const edited = await api(
+    "customer",
+    "PATCH",
+    `/api/reviews/mine/${pizzaReview.review.id}`,
+    { rating: 3, comment: "Updated integration review" },
+  );
+  assert.equal(edited.review.rating, 3);
+  assert.ok(Date.parse(edited.review.updatedAt) >= Date.parse(pizzaReview.review.updatedAt));
+  const afterEdit = await api(null, "GET", `/api/reviews/${itemIds[0]}`);
+  assert.equal(afterEdit.summary.ratingAvg, 3);
+  assert.equal(afterEdit.summary.ratingDistribution["3"], 1);
+  assert.equal(afterEdit.summary.ratingDistribution["5"], 0);
+  const menuAfterEdit = await api(null, "GET", `/api/menu/${itemIds[0]}`);
+  assert.equal(menuAfterEdit.item.ratingAvg, 3);
+  assert.equal(menuAfterEdit.item.reviewCount, 1);
+  assert.deepEqual(menuAfterEdit.item.ratingDistribution, afterEdit.summary.ratingDistribution);
+  pass("7/11 Owner edits update ratings, counts, and the 5-to-1-star distribution");
+
+  // 8. The owner can delete, and every rating aggregate falls back to zero.
+  await api("customer", "DELETE", `/api/reviews/mine/${pizzaReview.review.id}`);
+  const afterDelete = await api(null, "GET", `/api/reviews/${itemIds[0]}`);
+  assert.equal(afterDelete.summary.reviewCount, 0);
+  assert.equal(afterDelete.summary.ratingAvg, 0);
+  assert.deepEqual(afterDelete.summary.ratingDistribution, {
+    "5": 0,
+    "4": 0,
+    "3": 0,
+    "2": 0,
+    "1": 0,
+  });
+  const menuAfterDelete = await api(null, "GET", `/api/menu/${itemIds[0]}`);
+  assert.equal(menuAfterDelete.item.reviewCount, 0);
+  pass("8/11 Owner deletion recalculates ratings back to zero");
+
+  // 9. Other customers and vendors cannot modify an owner's review.
+  const moderationOrder = await api("customer", "POST", "/api/orders", orderPayload, 201);
+  await advanceToDelivered(moderationOrder.order.id);
+  const moderationReview = await api(
+    "customer",
+    "POST",
+    "/api/reviews",
+    {
+      orderId: moderationOrder.order.id,
+      menuItemId: itemIds[0],
+      rating: 2,
+      comment: "Review used for moderation checks",
+    },
+    201,
+  );
+  await api(
+    "otherCustomer",
+    "PATCH",
+    `/api/reviews/mine/${moderationReview.review.id}`,
+    { rating: 5, comment: "Hijacked review" },
+    404,
+  );
+  await api(
+    "otherCustomer",
+    "DELETE",
+    `/api/reviews/mine/${moderationReview.review.id}`,
+    undefined,
+    404,
+  );
+  await api(
+    "vendor",
+    "PATCH",
+    `/api/reviews/mine/${moderationReview.review.id}`,
+    { rating: 5, comment: "Vendor edited review" },
+    403,
+  );
+  await api(
+    "vendor",
+    "DELETE",
+    `/api/reviews/mine/${moderationReview.review.id}`,
+    undefined,
+    403,
+  );
+  pass("9/11 Cross-customer and vendor modification attempts are blocked");
+
+  // 10. Vendors see only their own products; admins can hide and restore.
+  const vendorReviews = await api("vendor", "GET", "/api/reviews/vendor?limit=100");
+  assert.ok(vendorReviews.reviews.some((review) => review.id === moderationReview.review.id));
+  const otherVendorReviews = await api("otherVendor", "GET", "/api/reviews/vendor?limit=100");
+  assert.ok(!otherVendorReviews.reviews.some((review) => review.id === moderationReview.review.id));
+  await api("vendor", "GET", "/api/admin/reviews", undefined, 403);
+  const adminReviews = await api("admin", "GET", "/api/admin/reviews?limit=100");
+  const adminRow = adminReviews.reviews.find((review) => review.id === moderationReview.review.id);
+  assert.ok(adminRow, "admin review list must contain the customer review");
+  assert.ok(adminRow.productName);
+  assert.ok(adminRow.customerEmail);
+  await api("admin", "PATCH", `/api/admin/reviews/${moderationReview.review.id}/hide`, {
+    hidden: true,
+  });
+  const hiddenPublic = await api(null, "GET", `/api/reviews/${itemIds[0]}`);
+  assert.equal(hiddenPublic.summary.reviewCount, 0);
+  assert.equal(hiddenPublic.summary.ratingAvg, 0);
+  const hiddenVendor = await api("vendor", "GET", "/api/reviews/vendor?limit=100");
+  assert.equal(
+    hiddenVendor.reviews.find((review) => review.id === moderationReview.review.id).isHidden,
+    true,
+  );
+  await api("admin", "PATCH", `/api/admin/reviews/${moderationReview.review.id}/hide`, {
+    hidden: false,
+  });
+  const restored = await api(null, "GET", `/api/reviews/${itemIds[0]}`);
+  assert.equal(restored.summary.ratingAvg, 2);
+  assert.equal(restored.summary.reviewCount, 1);
+  pass("10/11 Vendor visibility is scoped and admins can hide or restore reviews");
+
+  // 11. Cards and details use the same server stats; admins can remove reviews.
+  const detail = await api(null, "GET", `/api/menu/${itemIds[0]}`);
+  const cardList = await api(null, "GET", "/api/menu?limit=100");
+  const card = cardList.items.find((entry) => entry.id === itemIds[0]);
+  assert.ok(card, "menu listing must expose the reviewed product");
+  assert.equal(card.ratingAvg, detail.item.ratingAvg);
+  assert.equal(card.reviewCount, detail.item.reviewCount);
+  assert.deepEqual(card.ratingDistribution, detail.item.ratingDistribution);
+  assert.deepEqual(detail.item.ratingDistribution, restored.summary.ratingDistribution);
+  await api("admin", "DELETE", `/api/admin/reviews/${moderationReview.review.id}`);
+  const afterAdminRemove = await api(null, "GET", `/api/reviews/${itemIds[0]}`);
+  assert.equal(afterAdminRemove.summary.reviewCount, 0);
+  pass("11/11 Product cards and details share server stats; admin removal works");
 
   const restaurantReview = await api(
     "customer",

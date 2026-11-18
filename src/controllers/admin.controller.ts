@@ -135,9 +135,11 @@ export const listReviews = asyncHandler(async (req: Request, res: Response) => {
         {
           $lookup: {
             from: "users",
-            localField: "customerId",
-            foreignField: "_id",
-            pipeline: [{ $project: { name: 1, email: 1 } }],
+            let: { customerId: "$customerId" },
+            pipeline: [
+              { $match: { $expr: { $eq: [{ $toString: "$_id" }, "$$customerId"] } } },
+              { $project: { name: 1, email: 1 } },
+            ],
             as: "author",
           },
         },

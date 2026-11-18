@@ -104,12 +104,16 @@ const ratingSummaryFrom = (row?: RatingAggregate) => {
   };
 };
 
+// Better Auth user ids are strings in review documents while MongoDB stores
+// users._id as an ObjectId, so the lookup must compare string forms.
 const authorLookup = {
   $lookup: {
     from: "users",
-    localField: "customerId",
-    foreignField: "_id",
-    pipeline: [{ $project: { name: 1, image: 1 } }],
+    let: { customerId: "$customerId" },
+    pipeline: [
+      { $match: { $expr: { $eq: [{ $toString: "$_id" }, "$$customerId"] } } },
+      { $project: { name: 1, image: 1 } },
+    ],
     as: "author",
   },
 };
