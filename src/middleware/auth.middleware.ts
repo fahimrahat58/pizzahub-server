@@ -1,127 +1,139 @@
-import "dotenv/config";
-
-import type { Request, Response, NextFunction } from "express";
-
+import type { NextFunction, Request, Response } from "express";
 import { createRemoteJWKSet, jwtVerify } from "jose";
+import { ObjectId } from "mongodb";
 
-import { db } from "../config/database.js";
+import { collections } from "../config/database.js";
+import { env } from "../config/env.js";
+import type { UserRole } from "../types/models.js";
+import { isValidObjectId } from "../utils/query.js";
 
-const authURL = process.env.BETTER_AUTH_URL;
+const JWKS = createRemoteJWKSet(new URL(`${env.authUrl}/api/auth/jwks`));
 
-if (!authURL) {
-  throw new Error("BETTER_AUTH_URL is missing");
-}
-
-const JWKS = createRemoteJWKSet(new URL(`${authURL}/api/auth/jwks`));
-
-type UserRole = "admin" | "vendor" | "customer";
-
-interface AuthUser {
-  _id: string;
-  role: UserRole;
-  isBlocked?: boolean;
-}
-
+/**
+ * Verifies the Better Auth JWT (signature, exp, iss, aud), confirms the
+ * underlying Better Auth session is still alive, then loads the *current*
+ * role and blocked status from MongoDB. Nothing from the token is trusted
+ * for authorization decisions.
+ */
 export const verifyToken = async (
   req: Request,
   res: Response,
   next: NextFunction,
-) => {
+): Promise<void> => {
   try {
     const authorization = req.headers.authorization;
-
     if (!authorization?.startsWith("Bearer ")) {
-      return res.status(401).json({
-        success: false,
-        message: "Authentication token is required",
-      });
+      res
+        .status(401)
+        .json({ success: false, message: "Authentication token is required" });
+      return;
     }
 
     const token = authorization.slice(7).trim();
-
     if (!token) {
-      return res.status(401).json({
-        success: false,
-        message: "Invalid authorization header",
-      });
+      res
+        .status(401)
+        .json({ success: false, message: "Invalid authorization header" });
+      return;
     }
 
     const { payload } = await jwtVerify(token, JWKS, {
-      issuer: authURL,
-      audience: authURL,
+      issuer: env.authUrl,
+      audience: env.authUrl,
     });
 
     const userId = payload.sub;
+    if (!userId || !isValidObjectId(userId)) {
+      res
+        .status(401)
+        .json({ success: false, message: "Invalid token payload" });
+      return;
+    }
+    const userObjectId = new ObjectId(userId);
 
-    if (!userId) {
-      return res.status(401).json({
-        success: false,
-        message: "Invalid token payload",
+    if (typeof payload.sessionId === "string") {
+      if (!isValidObjectId(payload.sessionId)) {
+        res
+          .status(401)
+          .json({ success: false, message: "Invalid token payload" });
+        return;
+      }
+      // Better Auth's Mongo adapter stores session ids as ObjectIds in the
+      // singular `session` collection.
+      const session = await collections.sessions().findOne({
+        _id: new ObjectId(payload.sessionId),
+        userId: userObjectId,
+        expiresAt: { $gt: new Date() },
       });
+      if (!session) {
+        res.status(401).json({
+          success: false,
+          message: "Session expired. Please sign in again.",
+        });
+        return;
+      }
     }
 
-    // Always read the latest user data from MongoDB.
-    // This ensures role/block status is not taken
-    // from potentially stale JWT data.
-    const user = await db.collection<AuthUser>("users").findOne({
-      _id: userId,
-    });
+    const user = await collections.users().findOne(
+      { _id: userObjectId },
+      {
+        projection: {
+          name: 1,
+          email: 1,
+          image: 1,
+          role: 1,
+          isBlocked: 1,
+        },
+      },
+    );
 
     if (!user) {
-      return res.status(401).json({
-        success: false,
-        message: "User not found",
-      });
+      res.status(401).json({ success: false, message: "User not found" });
+      return;
     }
 
     if (user.isBlocked === true) {
-      return res.status(403).json({
+      res.status(403).json({
         success: false,
-        message: "Your account has been blocked",
+        message: "Your account has been blocked. Contact support.",
       });
+      return;
     }
 
     const validRoles: UserRole[] = ["admin", "vendor", "customer"];
-
     if (!validRoles.includes(user.role)) {
-      return res.status(403).json({
-        success: false,
-        message: "Invalid user role",
-      });
+      res.status(403).json({ success: false, message: "Invalid user role" });
+      return;
     }
 
     req.user = {
-      id: user._id,
+      id: user._id.toHexString(),
       role: user.role,
+      name: user.name,
+      email: user.email,
+      image: user.image,
     };
-
     next();
   } catch (error) {
-    console.error("Authentication error:", error);
-
-    return res.status(401).json({
+    // A missing/expired JWT or unreachable JWKS is an authentication failure.
+    void error;
+    res.status(401).json({
       success: false,
       message: "Invalid or expired authentication token",
     });
   }
 };
 
-export const requireRole = (...roles: UserRole[]) => {
-  return (req: Request, res: Response, next: NextFunction) => {
+export const requireRole =
+  (...roles: UserRole[]) =>
+  (req: Request, res: Response, next: NextFunction): void => {
     if (!req.user) {
-      return res.status(401).json({
-        success: false,
-        message: "Authentication required",
-      });
+      res.status(401).json({ success: false, message: "Authentication required" });
+      return;
     }
-
     if (!roles.includes(req.user.role)) {
-      return res.status(403).json({
-        success: false,
-        message: "You do not have permission",
-      });
+      res.status(403).json({ success: false, message: "You do not have permission" });
+      return;
     }
-
     next();
   };
-};
