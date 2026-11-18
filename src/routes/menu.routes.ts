@@ -11,6 +11,7 @@ import {
   getPublicMenuItem,
   listAdminMenu,
   listCategories,
+  listLocations,
   listPendingMenu,
   listPublicMenu,
   listVendorMenu,
@@ -27,6 +28,7 @@ const router = Router();
 // Static/public discovery routes must be registered before /:id.
 router.get("/featured", getFeaturedMenu);
 router.get("/categories", listCategories);
+router.get("/locations", listLocations);
 router.get("/", listPublicMenu);
 
 // Vendor menu management

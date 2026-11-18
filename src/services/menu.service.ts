@@ -40,10 +40,11 @@ export const canActivateMenuItem = async (
 };
 
 /**
- * Adds a trusted `vendorPremium` flag from MongoDB subscription state so
- * Premium vendors' approved items can be prioritised in public listings.
+ * Joins the owning vendor once per item. It supplies the vendor display name
+ * for cards and, from trusted MongoDB subscription state, a `vendorPremium`
+ * flag used to prioritise Premium vendors in public listings.
  */
-const premiumVendorLookup = {
+const vendorLookup = {
   $lookup: {
     from: "users",
     let: { vendorId: "$vendorId" },
@@ -67,6 +68,7 @@ const premiumVendorLookup = {
       },
       {
         $project: {
+          name: 1,
           subscriptionPlan: 1,
           subscriptionStatus: 1,
           subscriptionExpiresAt: 1,
@@ -77,8 +79,14 @@ const premiumVendorLookup = {
   },
 };
 
-const premiumVendorFields = {
+const vendorFields = {
   $addFields: {
+    vendorName: {
+      $let: {
+        vars: { vendor: { $arrayElemAt: ["$vendorInfo", 0] } },
+        in: "$$vendor.name",
+      },
+    },
     vendorPremium: {
       $let: {
         vars: { vendor: { $arrayElemAt: ["$vendorInfo", 0] } },
@@ -142,7 +150,7 @@ const ratingFields = {
  * One join supplies the real restaurant name/location for every menu item in
  * the same aggregation response. This avoids one restaurant query per card.
  */
-const restaurantLookup = {
+export const restaurantLookup = {
   $lookup: {
     from: "restaurants",
     localField: "restaurantId",
@@ -166,13 +174,14 @@ export const menuWithRatingsPipeline = (
   sort: Document,
   skip: number,
   limit: number,
-  premiumFirst = false,
+  _premiumFirst = false,
 ): Document[] => [
   { $match: match },
-  ...(premiumFirst ? [premiumVendorLookup, premiumVendorFields] : []),
+  vendorLookup,
   ratingLookup,
   ratingFields,
   restaurantLookup,
+  vendorFields,
   { $project: { ratingInfo: 0, vendorInfo: 0 } },
   ...(Object.keys(sort).length > 0 ? [{ $sort: sort }] : []),
   { $skip: skip },

@@ -14,6 +14,7 @@ const suffix = Date.now().toString(36);
 const password = "TestPass123!";
 const email = (label) => `pizzahub-it-${label}-${suffix}@example.com`;
 const imageUrl = "https://images.unsplash.com/photo-1513104890138-7c749659a591?w=800";
+const secondImageUrl = "https://images.unsplash.com/photo-1574071318508-1cdbab80d002?w=800";
 
 const jars = new Map();
 const tokens = new Map();
@@ -96,6 +97,7 @@ const signUp = async (actor, role) => {
         email: email(actor),
         password,
         role,
+        image: imageUrl,
       }),
     },
   );
@@ -231,7 +233,22 @@ try {
   const otherVendor = await signUp("otherVendor", "vendor");
   cleanupIds = [customer.id, vendor.id, adminCandidate.id, otherVendor.id];
 
+  for (const weakPassword of ["Ab1", "lowercase", "UPPERCASE"]) {
+    const weak = await authRequestWithRateLimitRetry("weak", "/api/auth/sign-up/email", {
+      method: "POST",
+      body: JSON.stringify({
+        name: "Weak Password User",
+        email: email(`weak-${weakPassword}`),
+        password: weakPassword,
+        role: "customer",
+      }),
+    });
+    assert.equal(weak.status, 400, `weak password ${weakPassword} must be rejected server-side`);
+  }
+  pass("Server rejects short and single-case passwords");
+
   const rawVendor = await db.collection("users").findOne({ _id: new ObjectId(vendor.id) });
+  assert.equal(rawVendor?.image, imageUrl, "signup must persist the optional profile image");
   assert.equal(rawVendor?.businessName ?? null, null);
   assert.equal(
     await db.collection("restaurants").countDocuments({ vendorId: vendor.id }),
@@ -269,6 +286,7 @@ try {
     ingredients: ["tomato", "cheese", "basil"],
     location: "Downtown",
     image: imageUrl,
+    images: [imageUrl, secondImageUrl],
   });
 
   const itemIds = [];
@@ -283,6 +301,7 @@ try {
     assert.equal(data.item.approvalStatus, "pending");
     assert.equal(data.item.isActive, false);
     assert.equal(data.item.location, "Downtown");
+    assert.deepEqual(data.item.images, [imageUrl, secondImageUrl]);
     assert.equal(data.item.restaurantId, restaurant.restaurant.id);
     assert.equal(data.item.restaurant?.id, restaurant.restaurant.id);
     assert.equal(data.item.restaurant?.name, restaurant.restaurant.name);
@@ -306,6 +325,14 @@ try {
     assert.equal(approved.message, "Pizza approved and published");
   }
   pass("Admin approval publishes pending items for the public menu");
+
+  const downtownMenu = await api(null, "GET", "/api/menu?location=Downtown&limit=100");
+  assert.ok(downtownMenu.items.length >= 3);
+  assert.ok(downtownMenu.items.every((item) => item.location === "Downtown"));
+  assert.ok(downtownMenu.items.every((item) => item.vendorName === `${vendor.name}`));
+  const locations = await api(null, "GET", "/api/menu/locations");
+  assert.ok(locations.locations.includes("Downtown"));
+  pass("Public menu filters by location and exposes the location list");
 
   const fourth = await api(
     "vendor",

@@ -14,6 +14,7 @@ import { menuItemDto } from "../utils/serialize.js";
 import {
   canActivateMenuItem,
   menuWithRatingsPipeline,
+  restaurantLookup,
 } from "../services/menu.service.js";
 import type { MenuItemDoc, RestaurantDoc } from "../types/models.js";
 
@@ -33,6 +34,7 @@ export const createMenuItemSchema = z.object({
   ingredients: z.array(z.string().trim().min(1).max(60)).min(1).max(30),
   location: z.string().trim().min(2, "Enter the area or city").max(100),
   image: imageUrl,
+  images: z.array(imageUrl).max(6).optional(),
   isActive: z.boolean().optional(),
 });
 
@@ -51,6 +53,10 @@ export const approvalSchema = z.object({
 
 const escapeRegex = (value: string): string =>
   value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/** Keeps the cover photo first and caps the gallery at six unique images. */
+const buildGallery = (cover: string, extra: string[] = []): string[] =>
+  [...new Set([cover, ...extra.filter((url) => url !== cover)])].slice(0, 6);
 
 const parseNumber = (value: unknown): number | undefined => {
   const text = firstString(value);
@@ -123,6 +129,7 @@ export const listPublicMenu = asyncHandler(async (req: Request, res: Response) =
   const { page, limit } = getPagination(req);
   const search = firstString(req.query.search)?.trim() ?? "";
   const category = firstString(req.query.category)?.trim() ?? "";
+  const location = firstString(req.query.location)?.trim() ?? "";
   const vendorId = firstString(req.query.vendorId)?.trim() ?? "";
   const restaurantId = parseRestaurantFilter(req.query.restaurantId);
   const minPrice = parseNumber(req.query.minPrice);
@@ -131,15 +138,30 @@ export const listPublicMenu = asyncHandler(async (req: Request, res: Response) =
   const sortBy = firstString(req.query.sort) ?? "newest";
 
   const filter: Document = { ...publicFilter() };
+  const orConditions: Document[] = [];
   if (search) {
     const expression = { $regex: escapeRegex(search), $options: "i" };
-    filter.$or = [
+    orConditions.push(
       { name: expression },
       { description: expression },
       { ingredients: expression },
-    ];
+    );
   }
   if (category) filter.category = category;
+  // New items store their own area / city. Legacy items inherit the
+  // restaurant address, so both sources must participate in the filter.
+  if (location) {
+    const expression = { $regex: escapeRegex(location), $options: "i" };
+    const matchingRestaurants = await collections
+      .restaurants()
+      .find({ address: expression }, { projection: { _id: 1 } })
+      .toArray();
+    orConditions.push(
+      { location: expression },
+      { restaurantId: { $in: matchingRestaurants.map((restaurant) => restaurant._id) } },
+    );
+  }
+  if (orConditions.length > 0) filter.$or = orConditions;
   if (vendorId) filter.vendorId = vendorId;
   if (restaurantId) filter.restaurantId = restaurantId;
   if (minPrice !== undefined || maxPrice !== undefined) {
@@ -249,6 +271,7 @@ export const createMenuItem = asyncHandler(async (req: Request, res: Response) =
     vendorId: req.user!.id,
     restaurantId: restaurant._id,
     ...itemData,
+    images: buildGallery(data.image, data.images),
     approvalStatus: "pending",
     // Force hidden regardless of any client-supplied isActive value.
     isActive: false,
@@ -297,6 +320,12 @@ export const updateMenuItem = asyncHandler(async (req: Request, res: Response) =
   }
 
   const { restaurantId: _restaurantId, isActive: _isActive, ...changes } = data;
+  if (changes.image !== undefined || changes.images !== undefined) {
+    changes.images = buildGallery(
+      changes.image ?? existing.image,
+      changes.images ?? existing.images ?? [],
+    );
+  }
   const item = await collections.menuItems().findOneAndUpdate(
     { _id: itemId, vendorId: req.user!.id },
     {
@@ -529,4 +558,37 @@ export const listCategories = asyncHandler(async (_req: Request, res: Response) 
     .menuItems()
     .distinct("category", publicFilter());
   res.json({ success: true, categories: categories.sort() });
+});
+
+export const listLocations = asyncHandler(async (_req: Request, res: Response) => {
+  const rows = await collections
+    .menuItems()
+    .aggregate<Document>([
+      { $match: publicFilter() },
+      restaurantLookup,
+      {
+        $project: {
+          _id: 0,
+          location: {
+            $cond: [
+              { $gt: [{ $strLenCP: { $ifNull: ["$location", ""] } }, 0] },
+              "$location",
+              { $ifNull: [{ $arrayElemAt: ["$restaurantInfo.address", 0] }, ""] },
+            ],
+          },
+        },
+      },
+    ])
+    .toArray();
+  const locations = [
+    ...new Set(
+      rows
+        .map((row) => String(row.location ?? "").trim())
+        .filter((value) => value.length > 0),
+    ),
+  ];
+  res.json({
+    success: true,
+    locations: locations.sort((a, b) => a.localeCompare(b)),
+  });
 });

@@ -94,7 +94,10 @@ export interface MenuItemDoc {
   ingredients: string[];
   /** Area / city where this item is offered. */
   location: string;
+  /** Cover photo. Legacy documents always have this field. */
   image: string;
+  /** Full gallery; the first entry is the cover photo. */
+  images?: string[];
   isActive: boolean;
   approvalStatus: ApprovalStatus;
   isFeatured: boolean;

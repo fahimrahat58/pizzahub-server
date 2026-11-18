@@ -51,6 +51,7 @@ type MenuEnrichment = {
   reviewCount?: number;
   restaurantInfo?: RestaurantSummarySource[];
   restaurant?: RestaurantSummarySource | null;
+  vendorName?: string | null;
 };
 
 const restaurantSummary = (
@@ -80,19 +81,24 @@ export const menuItemDto = (
   const restaurant = restaurantSummary(
     enriched.restaurantInfo?.[0] ?? enriched.restaurant ?? item.restaurant,
   );
+  // Legacy menu items have only `image`, so always expose a gallery with the
+  // cover photo first. Duplicates are removed without changing the order.
+  const images = [...new Set([item.image, ...(item.images ?? [])].filter(Boolean))];
 
   return {
     id: id(item),
     vendorId: item.vendorId,
     restaurantId: item.restaurantId?.toHexString() ?? null,
     restaurant,
+    vendorName: enriched.vendorName ?? null,
     name: item.name,
     description: item.description,
     category: item.category,
     price: item.price,
     ingredients: item.ingredients,
-    location: item.location ?? "",
+    location: item.location || restaurant?.address || "",
     image: item.image,
+    images,
     isActive: item.isActive,
     approvalStatus: item.approvalStatus,
     isFeatured: item.isFeatured,

@@ -4,6 +4,7 @@ import { ObjectId, type Document } from "mongodb";
 import { z } from "zod";
 
 import { collections } from "../config/database.js";
+import { sendOrderStatusEmail } from "../services/email.service.js";
 import {
   asyncHandler,
   badRequest,
@@ -289,10 +290,30 @@ const changeStatus = async (
   );
   if (!updated) throw notFound("Order not found");
   const names = await restaurantNamesForOrders([updated]);
+  const restaurantName =
+    names.get(updated.menuItemId.toHexString()) ??
+    updated.menuItemSnapshot.restaurantName ??
+    null;
+
+  let email: { sent: boolean; warning?: string } = { sent: false };
+  if (nextStatus === "accepted" || nextStatus === "rejected") {
+    email = await sendOrderStatusEmail({
+      to: updated.customerSnapshot.email,
+      customerName: updated.customerSnapshot.name,
+      orderNumber: updated.orderNumber,
+      itemName: updated.menuItemSnapshot.name,
+      restaurantName,
+      totalPrice: updated.totalPrice,
+      deliveryDate: updated.deliveryDate,
+      status: nextStatus,
+    });
+  }
+
   res.json({
     success: true,
     message: `Order ${note.toLowerCase()}`,
-    order: orderDto(updated, names.get(updated.menuItemId.toHexString())),
+    order: orderDto(updated, restaurantName ?? undefined),
+    email,
   });
 };
 

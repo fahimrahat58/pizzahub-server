@@ -22,6 +22,8 @@ const stripeSecretKey = process.env.STRIPE_SECRET_KEY?.trim() ?? "";
 const stripeWebhookSecret = process.env.STRIPE_WEBHOOK_SECRET?.trim() ?? "";
 const stripePriceIdMonthly = process.env.STRIPE_PRICE_ID_MONTHLY?.trim() ?? "";
 const stripePriceIdYearly = process.env.STRIPE_PRICE_ID_YEARLY?.trim() ?? "";
+const resendApiKey = process.env.RESEND_API_KEY?.trim() ?? "";
+const emailFrom = process.env.EMAIL_FROM?.trim() ?? "";
 
 const isPlaceholder = (value: string): boolean =>
   value.length === 0 ||
@@ -41,12 +43,19 @@ export const env = {
   stripeWebhookSecret,
   stripePriceIdMonthly,
   stripePriceIdYearly,
+  resendApiKey,
+  emailFrom,
 } as const;
 
 export const isImgBbConfigured = (): boolean =>
   env.imgbbApiKey.length > 0 &&
   !env.imgbbApiKey.startsWith("your_") &&
   env.imgbbApiKey !== "change-me";
+
+export const isEmailConfigured = (): boolean =>
+  !isPlaceholder(env.resendApiKey) &&
+  !isPlaceholder(env.emailFrom) &&
+  env.emailFrom.includes("@");
 
 /** True only when all four Stripe values are present and non-placeholder. */
 export const isStripeConfigured = (): boolean =>
