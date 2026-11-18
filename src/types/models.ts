@@ -7,8 +7,11 @@ export type SubscriptionPlan = "free" | "premium";
 export type LegacySubscriptionPlan = "pro";
 export type StoredSubscriptionPlan = SubscriptionPlan | LegacySubscriptionPlan;
 
-/** Billing intervals written by PizzaHub into Stripe metadata. */
+/** Billing plans accepted by PizzaHub's checkout API. */
 export type BillingPlanId = "monthly" | "yearly";
+
+/** Actual recurring interval read from the Stripe Price on a subscription. */
+export type BillingInterval = "month" | "year";
 
 /** Mirrors Stripe's subscription statuses that PizzaHub cares about. */
 export type SubscriptionStatus =
@@ -35,8 +38,10 @@ export interface UserDoc {
   address?: string | null;
   subscriptionPlan?: StoredSubscriptionPlan;
   subscriptionStatus?: SubscriptionStatus | null;
-  /** Billing interval from verified Stripe subscription metadata. */
+  /** Legacy plan id, derived from the verified Stripe Price when available. */
   billingPlanId?: BillingPlanId | null;
+  /** Actual interval from the Price attached to the verified subscription. */
+  billingInterval?: BillingInterval | null;
   /** Stripe Price ID from the verified subscription snapshot. */
   stripePriceId?: string | null;
   stripeCustomerId?: string | null;
@@ -44,8 +49,13 @@ export interface UserDoc {
   stripeCheckoutSessionId?: string | null;
   /** Event timestamp of the last accepted checkout/session linkage. */
   checkoutEventCreatedAt?: Date | null;
+  /** Period boundaries from the verified Stripe subscription snapshot. */
+  currentPeriodStart?: Date | null;
+  currentPeriodEnd?: Date | null;
   subscriptionExpiresAt?: Date | null;
   cancelAtPeriodEnd?: boolean;
+  /** Time Stripe reported that the subscription was actually canceled. */
+  canceledAt?: Date | null;
   /** Event timestamp/ID of the last accepted subscription state change. */
   subscriptionEventCreatedAt?: Date | null;
   subscriptionEventId?: string | null;
@@ -73,6 +83,7 @@ export interface SubscriptionEventDoc {
   stripeEventId: string;
   type: string;
   plan?: SubscriptionPlan | null;
+  billingInterval?: BillingInterval | null;
   status?: SubscriptionStatus | null;
   description?: string | null;
   createdAt: Date;
@@ -87,6 +98,7 @@ export interface TransactionDoc {
   vendorName: string;
   vendorEmail: string;
   plan: SubscriptionPlan;
+  billingInterval?: BillingInterval | null;
   amount: number;
   currency: string;
   status: SubscriptionStatus;

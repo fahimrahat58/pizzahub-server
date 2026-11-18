@@ -2,8 +2,10 @@ import { MongoServerError, ObjectId, type Document } from "mongodb";
 import type Stripe from "stripe";
 
 import { collections } from "../config/database.js";
+import { env } from "../config/env.js";
 import { isValidObjectId } from "../utils/query.js";
 import type {
+  BillingInterval,
   BillingPlanId,
   StoredSubscriptionPlan,
   SubscriptionEventDoc,
@@ -52,6 +54,7 @@ export interface EffectiveSubscription {
   isPremium: boolean;
   expiresAt: Date | null;
   cancelAtPeriodEnd: boolean;
+  canceledAt: Date | null;
   /** null means unlimited. */
   activeItemLimit: number | null;
   /** null means unlimited. */
@@ -64,6 +67,7 @@ type SubscriptionState = Pick<
   | "subscriptionStatus"
   | "subscriptionExpiresAt"
   | "cancelAtPeriodEnd"
+  | "canceledAt"
 >;
 
 /**
@@ -90,6 +94,7 @@ export const getEffectiveSubscription = (
     isPremium,
     expiresAt,
     cancelAtPeriodEnd: isPremium && (user.cancelAtPeriodEnd ?? false),
+    canceledAt: user.canceledAt ?? null,
     activeItemLimit: isPremium ? null : FREE_ITEM_LIMIT,
     activeRestaurantLimit: isPremium ? null : FREE_RESTAURANT_LIMIT,
   };
@@ -107,7 +112,13 @@ export const normalizeStripeStatus = (status: string): SubscriptionStatus => {
 
 type StripeSubscriptionState = Pick<
   Stripe.Subscription,
-  "id" | "customer" | "status" | "metadata" | "cancel_at_period_end" | "items"
+  | "id"
+  | "customer"
+  | "status"
+  | "metadata"
+  | "cancel_at_period_end"
+  | "canceled_at"
+  | "items"
 >;
 
 export type SubscriptionSyncInput = StripeSubscriptionState & {
@@ -116,6 +127,8 @@ export type SubscriptionSyncInput = StripeSubscriptionState & {
   checkoutSessionId?: string | null;
   /** Invoice events do not carry this flag, so keep the stored value. */
   preserveCancelAtPeriodEnd?: boolean;
+  /** subscription.deleted is authoritative even if Stripe's snapshot lags. */
+  statusOverride?: SubscriptionStatus;
 };
 
 export type CheckoutSessionSyncInput = {
@@ -129,8 +142,15 @@ export type CheckoutSessionSyncInput = {
 
 /**
  * Stripe API 2025-03-31 moved period boundaries onto subscription items.
- * Use the latest item period end as the renewal/expiration timestamp.
+ * Use the earliest item start and latest item end for the subscription period.
  */
+const periodStartOf = (subscription: StripeSubscriptionState): number => {
+  const starts = (subscription.items?.data ?? [])
+    .map((item) => item.current_period_start)
+    .filter((value): value is number => typeof value === "number");
+  return starts.length > 0 ? Math.min(...starts) : 0;
+};
+
 const periodEndOf = (subscription: StripeSubscriptionState): number => {
   const ends = (subscription.items?.data ?? [])
     .map((item) => item.current_period_end)
@@ -154,6 +174,35 @@ const priceIdOf = (subscription: StripeSubscriptionState): string | null => {
     if (item.price?.id) return item.price.id;
   }
   return null;
+};
+
+/** Maps a Price ID to the plan it was configured for. Never infers from metadata. */
+const configuredIntervalOf = (priceId: string | null): BillingInterval | null => {
+  if (!priceId) return null;
+  if (priceId === env.stripePriceIdMonthly) return "month";
+  if (priceId === env.stripePriceIdYearly) return "year";
+  return null;
+};
+
+/**
+ * The purchased cycle comes from the Price attached to Stripe's subscription
+ * snapshot. Configured Price IDs are a safe fallback for older snapshots that
+ * omit `recurring`; metadata is only a last-resort legacy fallback.
+ */
+const billingIntervalOf = (subscription: StripeSubscriptionState): BillingInterval | null => {
+  for (const item of subscription.items?.data ?? []) {
+    const interval = item.price?.recurring?.interval;
+    if (interval === "month" || interval === "year") return interval as BillingInterval;
+
+    const configured = configuredIntervalOf(item.price?.id ?? null);
+    if (configured) return configured;
+  }
+
+  const configured = configuredIntervalOf(priceIdOf(subscription));
+  if (configured) return configured;
+
+  const legacyPlan = billingPlanIdOf(subscription.metadata);
+  return legacyPlan === "monthly" ? "month" : legacyPlan === "yearly" ? "year" : null;
 };
 
 /**
@@ -225,6 +274,7 @@ export const syncSubscription = async (
     eventCreated,
     checkoutSessionId,
     preserveCancelAtPeriodEnd,
+    statusOverride,
     ...subscription
   } = input;
   const customerId = customerIdOf(subscription.customer);
@@ -238,7 +288,7 @@ export const syncSubscription = async (
     return null;
   }
 
-  const status = normalizeStripeStatus(subscription.status);
+  const status = statusOverride ?? normalizeStripeStatus(subscription.status);
   const incomingActive = isActiveSubscriptionStatus(status);
   const replacingSubscription =
     Boolean(vendor.stripeSubscriptionId) && vendor.stripeSubscriptionId !== subscription.id;
@@ -258,13 +308,23 @@ export const syncSubscription = async (
     return null;
   }
 
-  const plan: SubscriptionPlan = incomingActive ? "premium" : "free";
-  const periodEnd = periodEndOf(subscription);
   const eventSeconds =
     typeof eventCreated === "number" && Number.isFinite(eventCreated)
       ? eventCreated
       : Math.floor(Date.now() / 1000);
   const eventAt = new Date(eventSeconds * 1000);
+  const plan: SubscriptionPlan = incomingActive ? "premium" : "free";
+  const periodStart = periodStartOf(subscription);
+  const periodEnd = periodEndOf(subscription);
+  const billingInterval = billingIntervalOf(subscription) ?? vendor.billingInterval ?? null;
+  const billingPlanId: BillingPlanId | null =
+    billingInterval === "month"
+      ? "monthly"
+      : billingInterval === "year"
+        ? "yearly"
+        : billingPlanIdOf(subscription.metadata) ?? vendor.billingPlanId ?? null;
+  const canceledAtSeconds = subscription.canceled_at ?? (status === "canceled" ? eventSeconds : null);
+  const canceledAt = canceledAtSeconds ? new Date(canceledAtSeconds * 1000) : null;
 
   // Build an atomic guard from the vendor snapshot we just validated. Every
   // condition must still hold when MongoDB applies the update.
@@ -308,15 +368,19 @@ export const syncSubscription = async (
     $set: {
       subscriptionPlan: plan,
       subscriptionStatus: status,
-      billingPlanId: billingPlanIdOf(subscription.metadata) ?? vendor.billingPlanId ?? null,
+      billingPlanId,
+      billingInterval,
       stripePriceId: priceIdOf(subscription) ?? vendor.stripePriceId ?? null,
       stripeCustomerId: customerId,
       stripeSubscriptionId: subscription.id,
       stripeCheckoutSessionId: checkoutSessionId ?? vendor.stripeCheckoutSessionId ?? null,
+      currentPeriodStart: periodStart > 0 ? new Date(periodStart * 1000) : null,
+      currentPeriodEnd: periodEnd > 0 ? new Date(periodEnd * 1000) : null,
       subscriptionExpiresAt: periodEnd > 0 ? new Date(periodEnd * 1000) : null,
       cancelAtPeriodEnd: preserveCancelAtPeriodEnd
         ? vendor.cancelAtPeriodEnd ?? false
         : subscription.cancel_at_period_end === true,
+      canceledAt,
       subscriptionEventCreatedAt: eventAt,
       subscriptionEventId: eventId ?? null,
       updatedAt: new Date(),
@@ -512,6 +576,7 @@ export const recordSubscriptionEvent = async (input: {
   type: string;
   vendorId: string;
   plan?: SubscriptionPlan | null;
+  billingInterval?: BillingInterval | null;
   status?: SubscriptionStatus | null;
   description?: string | null;
 }): Promise<void> => {
@@ -521,6 +586,7 @@ export const recordSubscriptionEvent = async (input: {
     stripeEventId: input.eventId,
     type: input.type,
     plan: input.plan ?? null,
+    billingInterval: input.billingInterval ?? null,
     status: input.status ?? null,
     description: input.description ?? null,
     createdAt: new Date(),
@@ -540,6 +606,7 @@ export const recordTransaction = async (input: {
   eventId: string;
   vendorId: string;
   plan?: SubscriptionPlan | null;
+  billingInterval?: BillingInterval | null;
   amount: number;
   currency: string;
   status: SubscriptionStatus;
@@ -561,6 +628,7 @@ export const recordTransaction = async (input: {
     currency: input.currency.toUpperCase(),
     status: input.status,
     stripeEventId: input.eventId,
+    billingInterval: input.billingInterval ?? null,
     stripeSubscriptionId: input.subscriptionId ?? null,
     description: input.description ?? null,
     createdAt: new Date(),

@@ -16,6 +16,7 @@ import {
 } from "../services/subscription.service.js";
 import { asyncHandler } from "../utils/errors.js";
 import type {
+  BillingInterval,
   BillingPlanId,
   SubscriptionPlan,
   SubscriptionStatus,
@@ -49,6 +50,7 @@ const subscriptionInput = (
   status: snapshot.status,
   metadata: snapshot.metadata,
   cancel_at_period_end: snapshot.cancel_at_period_end,
+  canceled_at: snapshot.canceled_at,
   items: snapshot.items,
   ...options,
 });
@@ -71,6 +73,7 @@ const applyEvent = async (event: Stripe.Event): Promise<void> => {
   const eventCreated = eventSecondsOf(event);
   let vendorId: string | null = null;
   let plan: SubscriptionPlan | null = null;
+  let billingInterval: BillingInterval | null = null;
   let status: SubscriptionStatus | null = null;
   let description: string | null = null;
   let amount: number | null = null;
@@ -118,6 +121,7 @@ const applyEvent = async (event: Stripe.Event): Promise<void> => {
 
       if (vendor) {
         vendorId = vendor._id.toHexString();
+        billingInterval = vendor.billingInterval ?? null;
         if (snapshot) {
           const effective = getEffectiveSubscription(vendor);
           plan = effective.plan;
@@ -128,14 +132,34 @@ const applyEvent = async (event: Stripe.Event): Promise<void> => {
     }
 
     case "customer.subscription.created":
-    case "customer.subscription.updated":
-    case "customer.subscription.deleted": {
+    case "customer.subscription.updated": {
       const user = await syncSubscription(
         subscriptionInput(event.data.object, { eventId, eventCreated }),
       );
       description = `Subscription ${event.type.split(".").pop()}`;
       if (user) {
         vendorId = user._id.toHexString();
+        billingInterval = user.billingInterval ?? null;
+        const effective = getEffectiveSubscription(user);
+        plan = effective.plan;
+        status = eventStatus(effective.status);
+      }
+      break;
+    }
+
+    case "customer.subscription.deleted": {
+      const user = await syncSubscription(
+        subscriptionInput(event.data.object, {
+          eventId,
+          eventCreated,
+          // Stripe may send a lagging status; deletion is terminal by itself.
+          statusOverride: "canceled",
+        }),
+      );
+      description = `Subscription ${event.type.split(".").pop()}`;
+      if (user) {
+        vendorId = user._id.toHexString();
+        billingInterval = user.billingInterval ?? null;
         const effective = getEffectiveSubscription(user);
         plan = effective.plan;
         status = eventStatus(effective.status);
@@ -164,6 +188,7 @@ const applyEvent = async (event: Stripe.Event): Promise<void> => {
         );
         if (user) {
           vendorId = user._id.toHexString();
+          billingInterval = user.billingInterval ?? null;
           const effective = getEffectiveSubscription(user);
           plan = effective.plan;
           if (succeeded) status = eventStatus(effective.status);
@@ -187,6 +212,7 @@ const applyEvent = async (event: Stripe.Event): Promise<void> => {
       type: event.type,
       vendorId,
       plan,
+      billingInterval,
       status,
       description,
     });
@@ -199,6 +225,7 @@ const applyEvent = async (event: Stripe.Event): Promise<void> => {
       eventId,
       vendorId,
       plan,
+      billingInterval,
       amount,
       currency,
       status,

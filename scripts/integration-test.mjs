@@ -174,9 +174,12 @@ const subscriptionEvent = (
     status,
     cancelAtPeriodEnd,
     periodEnd,
+    periodStart = periodEnd - 30 * 24 * 60 * 60,
+    canceledAt = null,
     vendorId,
     plan = "monthly",
     priceId = monthlyPriceId,
+    interval = "month",
     subscriptionId = `sub_it_${suffix}`,
     created = Math.floor(Date.now() / 1000),
     type = "customer.subscription.updated",
@@ -195,14 +198,19 @@ const subscriptionEvent = (
       status,
       metadata: { vendorId, plan },
       cancel_at_period_end: cancelAtPeriodEnd,
+      canceled_at: canceledAt,
       items: {
         object: "list",
         data: [
           {
             id: `si_it_${suffix}`,
             object: "subscription_item",
+            current_period_start: periodStart,
             current_period_end: periodEnd,
-            price: { id: priceId },
+            price: {
+              id: priceId,
+              recurring: { interval, interval_count: 1 },
+            },
           },
         ],
       },
@@ -873,10 +881,16 @@ try {
     name: "vendor user",
     subscriptionPlan: "premium",
     stripeSubscriptionId: "sub_illegal",
+    billingInterval: "year",
+    currentPeriodEnd: new Date(Date.now() + 86_400_000).toISOString(),
+    canceledAt: new Date().toISOString(),
   });
   const afterProfile = await api("vendor", "GET", "/api/subscriptions/status");
   assert.equal(afterProfile.subscription.plan, "free");
   assert.equal(afterProfile.subscription.stripeSubscriptionId, null);
+  assert.equal(afterProfile.subscription.billingInterval, null);
+  assert.equal(afterProfile.subscription.currentPeriodEnd, null);
+  assert.equal(afterProfile.subscription.canceledAt, null);
   pass("Profile API cannot set subscription/billing fields");
 
   const planResponse = await api("vendor", "GET", "/api/subscriptions/plans");
@@ -885,7 +899,9 @@ try {
   const yearlyPlan = planResponse.plans.find((entry) => entry.id === "yearly");
   assert.ok(monthlyPlan && monthlyPlan.amount > 0);
   assert.ok(yearlyPlan && yearlyPlan.amount > 0);
-  pass("Plan prices are fetched server-side from Stripe");
+  assert.equal(monthlyPlan.interval, "month");
+  assert.equal(yearlyPlan.interval, "year");
+  pass("Plan prices are fetched server-side from Stripe with separate Price IDs");
 
   await api("vendor", "POST", "/api/subscriptions/create-checkout-session", { plan: "pro" }, 400);
   await api(
@@ -941,6 +957,7 @@ try {
 
   const billingNowSeconds = Math.floor(Date.now() / 1000);
   const futurePeriod = billingNowSeconds + 30 * 24 * 60 * 60;
+  const currentPeriodStart = billingNowSeconds - 30 * 24 * 60 * 60;
   const invalidEventId = `evt_it_invalid_${suffix}`;
   const invalidEvent = subscriptionEvent(invalidEventId, {
     customer: stripeCustomerId,
@@ -999,7 +1016,10 @@ try {
     status: "active",
     cancelAtPeriodEnd: false,
     periodEnd: futurePeriod,
+    periodStart: currentPeriodStart,
     vendorId: vendor.id,
+    // Conflicting metadata must not override the monthly Price on the snapshot.
+    plan: "yearly",
     created: billingNowSeconds,
     type: "customer.subscription.created",
   });
@@ -1011,7 +1031,17 @@ try {
   assert.equal(premiumStatus.subscription.stripeSubscriptionId, activationEvent.data.object.id);
   assert.equal(premiumStatus.subscription.stripeCheckoutSessionId, checkout.sessionId);
   assert.equal(premiumStatus.subscription.billingPlanId, "monthly");
+  assert.equal(premiumStatus.subscription.billingInterval, "month");
   assert.equal(premiumStatus.subscription.stripePriceId, monthlyPriceId);
+  assert.equal(
+    new Date(premiumStatus.subscription.currentPeriodStart).getTime(),
+    currentPeriodStart * 1000,
+  );
+  assert.equal(
+    new Date(premiumStatus.subscription.currentPeriodEnd).getTime(),
+    futurePeriod * 1000,
+  );
+  assert.equal(premiumStatus.subscription.canceledAt, null);
   assert.equal(
     new Date(premiumStatus.subscription.subscriptionExpiresAt).getTime(),
     futurePeriod * 1000,
@@ -1021,6 +1051,11 @@ try {
   const duplicate = await sendWebhook(activationEvent);
   assert.equal(duplicate.data.duplicate, true);
   const history = await api("admin", "GET", `/api/users/admin/subscriptions/${vendor.id}/history`);
+  const activationHistory = history.events.find(
+    (entry) => entry.stripeEventId === activationEventId,
+  );
+  assert.ok(activationHistory);
+  assert.equal(activationHistory.billingInterval, "month");
   assert.equal(history.events.filter((entry) => entry.stripeEventId === activationEventId).length, 1);
   pass("Duplicate Stripe event deliveries are idempotent");
 
@@ -1071,6 +1106,7 @@ try {
   assert.ok(paidTransaction, "invoice.paid must create a read-only transaction record");
   assert.equal(paidTransaction.amount, 20);
   assert.equal(paidTransaction.status, "active");
+  assert.equal(paidTransaction.billingInterval, "month");
   assert.equal(paidTransaction.stripeSubscriptionId, activationEvent.data.object.id);
   pass("Verified invoice.paid renews Premium and records the payment");
 
@@ -1086,6 +1122,7 @@ try {
   assert.equal(billingRow.stripeSubscriptionId, activationEvent.data.object.id);
   assert.equal(billingRow.stripeCheckoutSessionId, checkout.sessionId);
   assert.equal(billingRow.billingPlanId, "monthly");
+  assert.equal(billingRow.billingInterval, "month");
   assert.ok(billingRow.subscriptionExpiresAt);
   pass("Admin sees read-only billing fields and webhook-derived history");
 
@@ -1166,14 +1203,23 @@ try {
       status: "active",
       cancelAtPeriodEnd: true,
       periodEnd: futurePeriod,
+      periodStart: currentPeriodStart,
+      canceledAt: null,
       vendorId: vendor.id,
       created: billingNowSeconds + 3,
     }),
   );
   const cancelScheduled = await api("vendor", "GET", "/api/subscriptions/status");
   assert.equal(cancelScheduled.subscription.isPremium, true);
+  assert.equal(cancelScheduled.subscription.status, "active");
   assert.equal(cancelScheduled.subscription.cancelAtPeriodEnd, true);
-  pass("cancel_at_period_end keeps Premium until the period ends");
+  assert.equal(cancelScheduled.subscription.billingInterval, "month");
+  assert.equal(
+    new Date(cancelScheduled.subscription.currentPeriodEnd).getTime(),
+    futurePeriod * 1000,
+  );
+  assert.equal(cancelScheduled.subscription.canceledAt, null);
+  pass("cancel_at_period_end keeps Premium and the purchased cycle until the period ends");
 
   // Simulate time passing past the stored period end without touching the API.
   await db.collection("users").updateOne(
@@ -1251,6 +1297,8 @@ try {
       status: "canceled",
       cancelAtPeriodEnd: false,
       periodEnd: futurePeriod,
+      periodStart: currentPeriodStart,
+      canceledAt: billingNowSeconds + 6,
       vendorId: vendor.id,
       created: billingNowSeconds + 6,
       type: "customer.subscription.deleted",
@@ -1260,7 +1308,13 @@ try {
   const canceledStatus = await api("vendor", "GET", "/api/subscriptions/status");
   assert.equal(canceledStatus.subscription.status, "canceled");
   assert.equal(canceledStatus.subscription.plan, "free");
-  pass("Verified subscription.deleted webhook deactivates Premium");
+  assert.equal(canceledStatus.subscription.cancelAtPeriodEnd, false);
+  assert.equal(
+    new Date(canceledStatus.subscription.canceledAt).getTime(),
+    (billingNowSeconds + 6) * 1000,
+  );
+  assert.equal(canceledStatus.subscription.billingInterval, "month");
+  pass("Verified subscription.deleted webhook sets canceled state and keeps the purchased cycle");
 
   const staleEventId = `evt_it_stale_${suffix}`;
   webhookEventIds.push(staleEventId);
@@ -1292,9 +1346,11 @@ try {
       status: "active",
       cancelAtPeriodEnd: false,
       periodEnd: futurePeriod + 30 * 24 * 60 * 60,
+      periodStart: billingNowSeconds,
       vendorId: vendor.id,
       plan: "yearly",
       priceId: yearlyPriceId,
+      interval: "year",
       subscriptionId: `sub_it_renew_${suffix}`,
       created: billingNowSeconds + 7,
       type: "customer.subscription.created",
@@ -1305,8 +1361,14 @@ try {
   assert.equal(resubscribed.subscription.isPremium, true);
   assert.equal(resubscribed.subscription.stripeSubscriptionId, `sub_it_renew_${suffix}`);
   assert.equal(resubscribed.subscription.billingPlanId, "yearly");
+  assert.equal(resubscribed.subscription.billingInterval, "year");
   assert.equal(resubscribed.subscription.stripePriceId, yearlyPriceId);
-  pass("A new active subscription can replace a terminal canceled subscription");
+  assert.equal(
+    new Date(resubscribed.subscription.currentPeriodEnd).getTime(),
+    (futurePeriod + 30 * 24 * 60 * 60) * 1000,
+  );
+  assert.equal(resubscribed.subscription.canceledAt, null);
+  pass("A new yearly subscription replaces canceled state with its own Price-derived cycle");
 
   await api("customer", "POST", "/api/favorites", { menuItemId: itemIds[0] }, 201);
   const favoriteIds = await api("customer", "GET", "/api/favorites/ids");

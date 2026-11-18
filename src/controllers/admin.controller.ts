@@ -97,6 +97,7 @@ export const listTransactions = asyncHandler(
         vendorName: transaction.vendorName,
         vendorEmail: transaction.vendorEmail,
         plan: transaction.plan,
+        billingInterval: transaction.billingInterval ?? null,
         amount: transaction.amount,
         currency: transaction.currency,
         status: transaction.status,

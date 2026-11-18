@@ -103,12 +103,17 @@ export const getSubscriptionStatus = asyncHandler(
         activeItemLimit: effective.activeItemLimit,
         activeRestaurantLimit: effective.activeRestaurantLimit,
         billingPlanId: user.billingPlanId ?? null,
+        // The purchased cycle is Stripe-derived, never the frontend toggle.
+        billingInterval: user.billingInterval ?? null,
         stripeCustomerId: user.stripeCustomerId ?? null,
         stripeSubscriptionId: user.stripeSubscriptionId ?? null,
         stripeCheckoutSessionId: user.stripeCheckoutSessionId ?? null,
         stripePriceId: user.stripePriceId ?? null,
+        currentPeriodStart: user.currentPeriodStart ?? null,
+        currentPeriodEnd: user.currentPeriodEnd ?? effective.expiresAt,
         subscriptionExpiresAt: effective.expiresAt,
         cancelAtPeriodEnd: effective.cancelAtPeriodEnd,
+        canceledAt: effective.canceledAt,
         hasBillingAccount: Boolean(user.stripeCustomerId),
       },
     });
