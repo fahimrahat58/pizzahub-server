@@ -66,9 +66,39 @@ export const errorHandler = (
     return;
   }
 
+  // Body-parser errors (malformed JSON, oversized payloads) are plain Error
+  // objects with a status. Without this branch they became a generic 500,
+  // which hid the real upload problem from the client.
+  const status = statusOf(error);
+  if (status !== null && status >= 400 && status < 500) {
+    res.status(status).json({
+      success: false,
+      message: clientMessage(error, status),
+    });
+    return;
+  }
+
   console.error("Unhandled API error:", error);
   res.status(500).json({
     success: false,
     message: "Internal server error",
   });
+};
+
+const statusOf = (error: unknown): number | null => {
+  if (typeof error !== "object" || error === null) return null;
+  const value = (error as { status?: unknown; statusCode?: unknown }).status ??
+    (error as { statusCode?: unknown }).statusCode;
+  return typeof value === "number" && Number.isInteger(value) ? value : null;
+};
+
+const clientMessage = (error: unknown, status: number): string => {
+  if (typeof error !== "object" || error === null) return "Invalid request";
+  const type = (error as { type?: unknown }).type;
+  if (type === "entity.too.large" || status === 413) {
+    return "The image is too large. Choose a file under 5 MB.";
+  }
+  if (type === "entity.parse.failed") return "Invalid JSON request body";
+  if (status === 400) return "Invalid request";
+  return "Request could not be completed";
 };

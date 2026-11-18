@@ -67,12 +67,22 @@ export const uploadToImgBb = async (image: ValidatedImage): Promise<string> => {
   form.set("key", env.imgbbApiKey);
   form.set("image", image.base64);
 
-  const response = await fetch("https://api.imgbb.com/1/upload", {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: form.toString(),
-    signal: AbortSignal.timeout(15_000),
-  });
+  let response: Response;
+  try {
+    response = await fetch("https://api.imgbb.com/1/upload", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: form.toString(),
+      // A 5 MB base64 payload can take longer than 15s on slower links.
+      signal: AbortSignal.timeout(30_000),
+    });
+  } catch {
+    // Network failures and timeouts must not surface as a generic 500.
+    throw new ApiError(
+      502,
+      "Image upload service is unavailable. Please try again.",
+    );
+  }
 
   const payload = (await response.json().catch(() => null)) as {
     data?: { url?: string; display_url?: string };
@@ -86,5 +96,9 @@ export const uploadToImgBb = async (image: ValidatedImage): Promise<string> => {
     );
   }
 
-  return payload.data.display_url ?? payload.data.url;
+  const url = payload.data.display_url ?? payload.data.url;
+  if (!/^https:\/\/[^\s]+$/i.test(url)) {
+    throw new ApiError(502, "Image upload returned an invalid image URL");
+  }
+  return url;
 };
