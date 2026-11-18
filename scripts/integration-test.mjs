@@ -261,14 +261,14 @@ try {
   assert.equal(restaurant.restaurant.name, "Test Kitchen");
   pass("Vendor restaurant profile saved");
 
-  const menuPayload = (name, isActive = true) => ({
+  const menuPayload = (name) => ({
     name,
     description: `A test pizza called ${name} with a full description`,
     category: "Pizza",
     price: 10 + name.length,
     ingredients: ["tomato", "cheese", "basil"],
+    location: "Downtown",
     image: imageUrl,
-    isActive,
   });
 
   const itemIds = [];
@@ -280,35 +280,53 @@ try {
       menuPayload(`Integration Pizza ${index}`),
       201,
     );
-    assert.equal(data.item.approvalStatus, "approved");
-    assert.equal(data.item.isActive, true);
+    assert.equal(data.item.approvalStatus, "pending");
+    assert.equal(data.item.isActive, false);
+    assert.equal(data.item.location, "Downtown");
     assert.equal(data.item.restaurantId, restaurant.restaurant.id);
     assert.equal(data.item.restaurant?.id, restaurant.restaurant.id);
     assert.equal(data.item.restaurant?.name, restaurant.restaurant.name);
     itemIds.push(data.item.id);
   }
-  pass("Vendor items publish immediately with the sole restaurant inferred");
+  const pendingBrowse = await api(null, "GET", "/api/menu?limit=100");
+  for (const id of itemIds) {
+    assert.ok(!pendingBrowse.items.some((item) => item.id === id));
+  }
+  pass("New vendor items are saved pending, hidden, and tied to the sole restaurant");
 
-  const blockedCreate = await api(
-    "vendor",
-    "POST",
-    "/api/menu/vendor",
-    menuPayload("Integration Pizza Over Limit"),
-    409,
-  );
-  assert.match(blockedCreate.message, /maximum of 3 active menu items/i);
+  for (const id of itemIds) {
+    const approved = await api(
+      "admin",
+      "PATCH",
+      `/api/menu/admin/${id}/approval`,
+      { approvalStatus: "approved" },
+    );
+    assert.equal(approved.item.approvalStatus, "approved");
+    assert.equal(approved.item.isActive, true);
+    assert.equal(approved.message, "Pizza approved and published");
+  }
+  pass("Admin approval publishes pending items for the public menu");
+
   const fourth = await api(
     "vendor",
     "POST",
     "/api/menu/vendor",
-    menuPayload("Integration Pizza 4", false),
+    menuPayload("Integration Pizza 4"),
     201,
   );
-  assert.equal(fourth.item.approvalStatus, "approved");
+  assert.equal(fourth.item.approvalStatus, "pending");
   assert.equal(fourth.item.isActive, false);
   assert.equal(fourth.item.restaurantId, restaurant.restaurant.id);
   itemIds.push(fourth.item.id);
-  pass("Free plan blocks a fourth active item at creation; unpublished items are allowed");
+  const blockedApproval = await api(
+    "admin",
+    "PATCH",
+    `/api/menu/admin/${fourth.item.id}/approval`,
+    { approvalStatus: "approved" },
+    409,
+  );
+  assert.match(blockedApproval.message, /maximum of 3 active menu items/i);
+  pass("Free plan blocks admin approval of a fourth active item; pending items are allowed");
 
   await api(
     "otherVendor",
@@ -358,19 +376,19 @@ try {
     "POST",
     "/api/menu/vendor",
     {
-      ...menuPayload("Integration Pizza Second Location", false),
+      ...menuPayload("Integration Pizza Second Location"),
       restaurantId: secondRestaurant.restaurant.id,
     },
     201,
   );
   assert.equal(assignedItem.item.restaurantId, secondRestaurant.restaurant.id);
   assert.equal(assignedItem.item.restaurant?.id, secondRestaurant.restaurant.id);
-  assert.equal(assignedItem.item.approvalStatus, "approved");
+  assert.equal(assignedItem.item.approvalStatus, "pending");
   await api(
     "vendor",
     "POST",
     "/api/menu/vendor",
-    menuPayload("Integration Pizza No Selection", false),
+    menuPayload("Integration Pizza No Selection"),
     400,
   );
   await api(
@@ -378,7 +396,7 @@ try {
     "POST",
     "/api/menu/vendor",
     {
-      ...menuPayload("Integration Pizza Bad Restaurant", false),
+      ...menuPayload("Integration Pizza Bad Restaurant"),
       restaurantId: new ObjectId().toHexString(),
     },
     400,
@@ -388,7 +406,7 @@ try {
     "POST",
     "/api/menu/vendor",
     {
-      ...menuPayload("Integration Pizza Foreign Restaurant", false),
+      ...menuPayload("Integration Pizza Foreign Restaurant"),
       restaurantId: foreignRestaurant.restaurant.id,
     },
     400,
@@ -397,14 +415,22 @@ try {
 
   // --- Admin visibility, unpublish/republish, and takedown ------------------
   const adminAll = await api("admin", "GET", "/api/menu/admin/all?limit=100");
-  for (const id of itemIds) {
+  for (const id of itemIds.slice(0, 3)) {
     const row = adminAll.items.find((item) => item.id === id);
     assert.ok(row, `admin all item ${id}`);
     assert.equal(row.approvalStatus, "approved");
   }
+  assert.equal(
+    adminAll.items.find((item) => item.id === itemIds[3])?.approvalStatus,
+    "pending",
+  );
+  const adminPending = await api("admin", "GET", "/api/menu/admin/all?status=pending");
+  assert.ok(adminPending.items.some((item) => item.id === itemIds[3]));
+  const adminSearch = await api("admin", "GET", "/api/menu/admin/all?search=Downtown");
+  assert.ok(adminSearch.items.some((item) => item.id === itemIds[0]));
   await api("vendor", "GET", "/api/menu/admin/all", undefined, 403);
   await api("customer", "GET", "/api/menu/admin/all", undefined, 403);
-  pass("Admin can list every menu item; non-admins cannot use admin menu routes");
+  pass("Admin can filter/search every menu item; non-admins cannot use admin menu routes");
 
   const publicMenu = await api(null, "GET", "/api/menu?limit=100");
   for (const id of itemIds.slice(0, 3)) {
@@ -448,8 +474,16 @@ try {
     { isActive: true },
     409,
   );
-  assert.match(blockedUpdate.message, /maximum of 3 active menu items/i);
-  pass("Vendor cannot bypass the free active limit through the edit endpoint");
+  assert.match(blockedUpdate.message, /awaiting admin approval/i);
+  const blockedToggle = await api(
+    "vendor",
+    "PATCH",
+    `/api/menu/vendor/${itemIds[3]}/active`,
+    { isActive: true },
+    409,
+  );
+  assert.match(blockedToggle.message, /awaiting admin approval/i);
+  pass("Vendor cannot publish a pending item through edit or availability endpoints");
 
   const hiddenByAdmin = await api(
     "admin",
@@ -474,7 +508,7 @@ try {
   assert.equal(restoredByAdmin.message, "Pizza restored");
   const afterAdminRestore = await api(null, "GET", "/api/menu?limit=100");
   assert.ok(afterAdminRestore.items.some((item) => item.id === itemIds[1]));
-  pass("Admin approval route hides and restores items without a pending-creation step");
+  pass("Admin can hide and restore reviewed items; rejected items stay hidden from customers");
 
   // --- Safe restaurant deletion for a restaurant with no history ------------
   const restaurantDelete = await api(
@@ -601,11 +635,29 @@ try {
         client_reference_id: vendor.id,
         metadata: { vendorId: vendor.id, plan: "monthly" },
         subscription: null,
+        amount_total: 1500,
+        currency: "usd",
       },
     },
   });
   assert.equal(checkoutCompleted.response.status, 200, JSON.stringify(checkoutCompleted.data));
   pass("Verified checkout.session.completed events are accepted");
+
+  const transactionList = await api("admin", "GET", "/api/admin/transactions");
+  const checkoutTransaction = transactionList.transactions.find(
+    (entry) => entry.stripeEventId === checkoutEventId,
+  );
+  assert.ok(checkoutTransaction, "verified checkout must create a transaction record");
+  assert.equal(checkoutTransaction.vendorId, vendor.id);
+  assert.equal(checkoutTransaction.vendorName, vendor.name);
+  assert.equal(checkoutTransaction.vendorEmail, vendor.email);
+  assert.equal(checkoutTransaction.plan, "premium");
+  assert.equal(checkoutTransaction.amount, 15);
+  assert.equal(checkoutTransaction.currency, "USD");
+  assert.equal(checkoutTransaction.status, "incomplete");
+  await api("vendor", "GET", "/api/admin/transactions", undefined, 403);
+  await api("admin", "PATCH", "/api/admin/transactions", { status: "active" }, 404);
+  pass("Transactions are read-only, webhook-derived, and admin-only");
 
   const activationEventId = `evt_it_activate_${suffix}`;
   webhookEventIds.push(activationEventId);
@@ -678,13 +730,14 @@ try {
   pass("Duplicate active subscriptions are blocked");
 
   const fourthActive = await api(
-    "vendor",
+    "admin",
     "PATCH",
-    `/api/menu/vendor/${itemIds[3]}/active`,
-    { isActive: true },
+    `/api/menu/admin/${itemIds[3]}/approval`,
+    { approvalStatus: "approved" },
   );
+  assert.equal(fourthActive.item.approvalStatus, "approved");
   assert.equal(fourthActive.item.isActive, true);
-  pass("Premium vendors can activate more than three menu items");
+  pass("Premium accounts may approve more than three active menu items");
 
   const extraItem = await api(
     "vendor",
@@ -696,13 +749,21 @@ try {
       category: "Pizza",
       price: 15,
       ingredients: ["tomato", "cheese", "basil"],
+      location: "Riverside",
       image: imageUrl,
-      isActive: true,
     },
     201,
   );
-  assert.equal(extraItem.item.approvalStatus, "approved");
-  assert.equal(extraItem.item.isActive, true);
+  assert.equal(extraItem.item.approvalStatus, "pending");
+  assert.equal(extraItem.item.isActive, false);
+  const approvedExtra = await api(
+    "admin",
+    "PATCH",
+    `/api/menu/admin/${extraItem.item.id}/approval`,
+    { approvalStatus: "approved" },
+  );
+  assert.equal(approvedExtra.item.approvalStatus, "approved");
+  assert.equal(approvedExtra.item.isActive, true);
   itemIds.push(extraItem.item.id);
   await api("vendor", "PATCH", `/api/menu/vendor/${extraItem.item.id}/active`, {
     isActive: false,
@@ -878,8 +939,10 @@ try {
 
   const stats = await api("admin", "GET", "/api/admin/stats");
   assert.ok(stats.stats.totalUsers >= 4);
-  assert.ok(stats.stats.pendingMenuItems >= 0);
-  pass("Admin stats endpoint returns platform data");
+  assert.equal(typeof stats.stats.pendingMenuItems, "number");
+  assert.ok(stats.stats.totalMenuItems >= 4);
+  assert.ok(stats.stats.totalTransactions >= 1);
+  pass("Admin stats returns users, menu, pending items, and transaction totals");
 
   const userSearch = await api(
     "admin",
@@ -934,6 +997,9 @@ try {
       db.collection("reviews").deleteMany({ customerId: { $in: cleanupIds } }),
       db.collection("stripeEvents").deleteMany({ _id: { $in: webhookEventIds } }),
       db.collection("subscriptionEvents").deleteMany({
+        stripeEventId: { $in: webhookEventIds },
+      }),
+      db.collection("transactions").deleteMany({
         stripeEventId: { $in: webhookEventIds },
       }),
     ]);

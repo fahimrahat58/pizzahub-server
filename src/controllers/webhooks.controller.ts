@@ -9,6 +9,7 @@ import {
   getEffectiveSubscription,
   normalizeStripeStatus,
   recordSubscriptionEvent,
+  recordTransaction,
   releaseStripeEvent,
   syncSubscription,
 } from "../services/subscription.service.js";
@@ -35,6 +36,9 @@ const applyEvent = async (event: Stripe.Event): Promise<void> => {
   let plan: SubscriptionPlan | null = null;
   let status: SubscriptionStatus | null = null;
   let description: string | null = null;
+  let amount: number | null = null;
+  let currency = "usd";
+  let paymentSubscriptionId: string | null = null;
 
   switch (event.type) {
     case "checkout.session.completed": {
@@ -42,6 +46,10 @@ const applyEvent = async (event: Stripe.Event): Promise<void> => {
       vendorId = session.metadata?.vendorId ?? session.client_reference_id ?? null;
       description = "Checkout completed";
       const subscriptionId = subscriptionIdOf(session.subscription);
+      // Stripe reports monetary amounts in the smallest currency unit.
+      amount = (session.amount_total ?? 0) / 100;
+      currency = session.currency ?? "usd";
+      paymentSubscriptionId = subscriptionId;
 
       if (subscriptionId) {
         // Retrieve the subscription so we store Stripe's authoritative status.
@@ -53,6 +61,12 @@ const applyEvent = async (event: Stripe.Event): Promise<void> => {
           plan = effective.plan;
           status = eventStatus(effective.status);
         }
+      } else {
+        // A completed checkout with no subscription yet still represents a
+        // verified payment. Record it as an incomplete Premium transaction;
+        // the following subscription event finalises the plan state.
+        plan = "premium";
+        status = "incomplete";
       }
       break;
     }
@@ -79,10 +93,13 @@ const applyEvent = async (event: Stripe.Event): Promise<void> => {
       const succeeded = event.type === "invoice.payment_succeeded";
       description = succeeded ? "Renewal payment succeeded" : "Renewal payment failed";
       status = succeeded ? "active" : "past_due";
+      amount = ((succeeded ? invoice.amount_paid : invoice.amount_due) ?? 0) / 100;
+      currency = invoice.currency ?? "usd";
 
       const subscriptionId = subscriptionIdOf(
         invoice.parent?.subscription_details?.subscription,
       );
+      paymentSubscriptionId = subscriptionId;
       if (subscriptionId) {
         const subscription = await stripe.subscriptions.retrieve(subscriptionId);
         const user = await syncSubscription(subscription);
@@ -108,6 +125,21 @@ const applyEvent = async (event: Stripe.Event): Promise<void> => {
       vendorId,
       plan,
       status,
+      description,
+    });
+  }
+
+  // Only payment events produce a transaction record; subscription lifecycle
+  // events without an amount are tracked in subscriptionEvents above.
+  if (vendorId && amount !== null && status) {
+    await recordTransaction({
+      eventId: event.id,
+      vendorId,
+      plan,
+      amount,
+      currency,
+      status,
+      subscriptionId: paymentSubscriptionId,
       description,
     });
   }

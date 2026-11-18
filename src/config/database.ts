@@ -8,6 +8,7 @@ import type {
   RestaurantDoc,
   ReviewDoc,
   StripeEventDoc,
+  TransactionDoc,
   SubscriptionEventDoc,
   UserDoc,
 } from "../types/models.js";
@@ -60,4 +61,7 @@ export const collections = {
   // Read-only billing history derived exclusively from verified webhooks.
   subscriptionEvents: (): Collection<SubscriptionEventDoc> =>
     db.collection<SubscriptionEventDoc>("subscriptionEvents"),
+  // Read-only payment transactions created from verified Stripe webhooks.
+  transactions: (): Collection<TransactionDoc> =>
+    db.collection<TransactionDoc>("transactions"),
 };

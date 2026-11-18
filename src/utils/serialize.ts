@@ -91,6 +91,7 @@ export const menuItemDto = (
     category: item.category,
     price: item.price,
     ingredients: item.ingredients,
+    location: item.location ?? "",
     image: item.image,
     isActive: item.isActive,
     approvalStatus: item.approvalStatus,

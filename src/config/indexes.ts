@@ -159,6 +159,20 @@ export const createIndexes = async (): Promise<void> => {
           .subscriptionEvents()
           .createIndex({ stripeEventId: 1 }, { unique: true }),
     },
+    {
+      name: "transactions.vendor",
+      run: () =>
+        collections
+          .transactions()
+          .createIndex({ vendorId: 1, createdAt: -1 }),
+    },
+    {
+      name: "transactions.stripeEvent",
+      run: () =>
+        collections
+          .transactions()
+          .createIndex({ stripeEventId: 1 }, { unique: true }),
+    },
   ];
 
   await Promise.allSettled(

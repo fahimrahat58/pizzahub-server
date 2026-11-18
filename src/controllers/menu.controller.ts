@@ -31,8 +31,9 @@ export const createMenuItemSchema = z.object({
   category: z.string().trim().min(2).max(40),
   price: z.number().positive().max(1000),
   ingredients: z.array(z.string().trim().min(1).max(60)).min(1).max(30),
+  location: z.string().trim().min(2, "Enter the area or city").max(100),
   image: imageUrl,
-  isActive: z.boolean().default(true),
+  isActive: z.boolean().optional(),
 });
 
 export const updateMenuItemSchema = createMenuItemSchema
@@ -239,16 +240,18 @@ export const createMenuItem = asyncHandler(async (req: Request, res: Response) =
     data.restaurantId,
   );
 
-  if (data.isActive) await assertCanPublish(req.user!.id);
-
-  const { restaurantId: _restaurantId, ...itemData } = data;
+  // New items always start pending and hidden. An administrator must approve
+  // them before they become visible and orderable on the public menu.
+  const { restaurantId: _restaurantId, isActive: _isActive, ...itemData } = data;
   const now = new Date();
   const document: MenuItemDoc = {
     _id: new ObjectId(),
     vendorId: req.user!.id,
     restaurantId: restaurant._id,
     ...itemData,
-    approvalStatus: "approved",
+    approvalStatus: "pending",
+    // Force hidden regardless of any client-supplied isActive value.
+    isActive: false,
     isFeatured: false,
     createdAt: now,
     updatedAt: now,
@@ -257,7 +260,7 @@ export const createMenuItem = asyncHandler(async (req: Request, res: Response) =
   await collections.menuItems().insertOne(document);
   res.status(201).json({
     success: true,
-    message: "Pizza published",
+    message: "Pizza submitted for admin approval",
     item: menuItemDto(document, { restaurant: restaurantSummary(restaurant) }),
   });
 });
@@ -283,24 +286,23 @@ export const updateMenuItem = asyncHandler(async (req: Request, res: Response) =
     requestedRestaurantId,
   );
 
-  if (
-    data.isActive === true &&
-    (existing.approvalStatus === "approved" || existing.approvalStatus === "pending")
-  ) {
+  // Only administrators can approve pending items or restore rejected ones.
+  if (data.isActive === true && existing.approvalStatus !== "approved") {
+    throw conflict(
+      "This item is awaiting admin approval. Only an administrator can publish it.",
+    );
+  }
+  if (data.isActive === true && existing.approvalStatus === "approved") {
     await assertCanPublish(req.user!.id, itemId);
   }
 
-  const { restaurantId: _restaurantId, ...changes } = data;
-  const willPublishLegacyPending =
-    existing.approvalStatus === "pending" && data.isActive !== false;
-
+  const { restaurantId: _restaurantId, isActive: _isActive, ...changes } = data;
   const item = await collections.menuItems().findOneAndUpdate(
     { _id: itemId, vendorId: req.user!.id },
     {
       $set: {
         ...changes,
         restaurantId: restaurant._id,
-        ...(willPublishLegacyPending ? { approvalStatus: "approved" } : {}),
         updatedAt: new Date(),
       },
     },
@@ -341,6 +343,9 @@ export const toggleMenuItemActive = asyncHandler(
     if (isActive && item.approvalStatus === "rejected") {
       throw conflict("This item was removed by an administrator");
     }
+    if (isActive && item.approvalStatus === "pending") {
+      throw conflict("This item is awaiting admin approval and cannot be published yet");
+    }
 
     let restaurant: RestaurantDoc | null = null;
     if (isActive) {
@@ -356,9 +361,6 @@ export const toggleMenuItemActive = asyncHandler(
       {
         $set: {
           isActive,
-          ...(isActive && item.approvalStatus === "pending"
-            ? { approvalStatus: "approved" }
-            : {}),
           updatedAt: new Date(),
         },
       },
@@ -379,9 +381,19 @@ export const toggleMenuItemActive = asyncHandler(
 export const listAdminMenu = asyncHandler(async (req: Request, res: Response) => {
   const { page, limit } = getPagination(req);
   const status = firstString(req.query.status);
+  const search = firstString(req.query.search)?.trim();
   const filter: Document = {};
   if (status && ["pending", "approved", "rejected"].includes(status)) {
     filter.approvalStatus = status;
+  }
+  if (search) {
+    // Escape regex special characters so search text is treated literally.
+    const escaped = escapeRegex(search);
+    filter.$or = [
+      { name: { $regex: escaped, $options: "i" } },
+      { category: { $regex: escaped, $options: "i" } },
+      { location: { $regex: escaped, $options: "i" } },
+    ];
   }
 
   const pipeline = menuWithRatingsPipeline(
@@ -431,8 +443,13 @@ export const reviewMenuItem = asyncHandler(async (req: Request, res: Response) =
   const item = await collections.menuItems().findOne({ _id: itemId });
   if (!item) throw notFound("Pizza not found");
 
+  // Approving a pending submission publishes it by default; hiding/restoring
+  // an already-reviewed item keeps its current availability unless overridden.
   const nextActive =
-    approvalStatus === "rejected" ? false : (isActive ?? item.isActive);
+    approvalStatus === "rejected"
+      ? false
+      : (isActive ??
+        (item.approvalStatus === "pending" ? true : item.isActive));
 
   if (approvalStatus === "approved" && nextActive) {
     if (!item.restaurantId) {
@@ -469,7 +486,11 @@ export const reviewMenuItem = asyncHandler(async (req: Request, res: Response) =
   res.json({
     success: true,
     message:
-      approvalStatus === "approved" ? "Pizza restored" : "Pizza hidden",
+      approvalStatus === "approved"
+        ? item.approvalStatus === "pending"
+          ? "Pizza approved and published"
+          : "Pizza restored"
+        : "Pizza hidden",
     item: menuItemDto(updated),
   });
 });

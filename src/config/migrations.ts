@@ -4,10 +4,10 @@ import { collections } from "./database.js";
 import type { MenuItemDoc } from "../types/models.js";
 
 /**
- * Brings legacy published menu data in line with the current rules:
- * - no menu item stays in the obsolete `pending` state;
- * - an item is only active when it has a restaurant that really belongs to its
- *   vendor;
+ * Brings legacy menu data in line with the current rules:
+ * - items awaiting admin approval stay pending and hidden;
+ * - an item is only active when it is approved and has a restaurant that really
+ *   belongs to its vendor;
  * - unusable orphan items with no order/review history are removed;
  * - orders and their snapshots are never modified.
  */
@@ -51,9 +51,13 @@ export const migrateMenuPublishing = async (): Promise<void> => {
       ? currentRestaurantId
       : inferredRestaurantId;
 
-    const nextApprovalStatus =
-      item.approvalStatus === "rejected" ? "rejected" : "approved";
-    const nextActive = Boolean(validRestaurantId) && item.isActive;
+    // Preserve the review state. Pending items remain hidden until an admin
+    // approves them; rejected items stay hidden as well.
+    const nextApprovalStatus = item.approvalStatus ?? "pending";
+    const nextActive =
+      Boolean(validRestaurantId) &&
+      nextApprovalStatus === "approved" &&
+      item.isActive;
     const shouldUpdate =
       item.approvalStatus !== nextApprovalStatus ||
       item.isActive !== nextActive ||

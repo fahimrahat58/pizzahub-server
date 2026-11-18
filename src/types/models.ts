@@ -67,6 +67,22 @@ export interface SubscriptionEventDoc {
 
 export type ApprovalStatus = "pending" | "approved" | "rejected";
 
+/** Read-only billing record created from verified Stripe webhooks. */
+export interface TransactionDoc {
+  _id: ObjectId;
+  vendorId: string;
+  vendorName: string;
+  vendorEmail: string;
+  plan: SubscriptionPlan;
+  amount: number;
+  currency: string;
+  status: SubscriptionStatus;
+  stripeEventId: string;
+  stripeSubscriptionId?: string | null;
+  description?: string | null;
+  createdAt: Date;
+}
+
 export interface MenuItemDoc {
   _id: ObjectId;
   vendorId: string;
@@ -76,6 +92,8 @@ export interface MenuItemDoc {
   category: string;
   price: number;
   ingredients: string[];
+  /** Area / city where this item is offered. */
+  location: string;
   image: string;
   isActive: boolean;
   approvalStatus: ApprovalStatus;

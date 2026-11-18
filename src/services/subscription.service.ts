@@ -8,6 +8,7 @@ import type {
   SubscriptionEventDoc,
   SubscriptionPlan,
   SubscriptionStatus,
+  TransactionDoc,
   UserDoc,
 } from "../types/models.js";
 
@@ -254,6 +255,47 @@ export const recordSubscriptionEvent = async (input: {
 
   await collections
     .subscriptionEvents()
+    .updateOne(
+      { stripeEventId: input.eventId },
+      { $setOnInsert: document },
+      { upsert: true },
+    );
+};
+
+/** Records a payment transaction from a verified Stripe webhook event. */
+export const recordTransaction = async (input: {
+  eventId: string;
+  vendorId: string;
+  plan?: SubscriptionPlan | null;
+  amount: number;
+  currency: string;
+  status: SubscriptionStatus;
+  subscriptionId?: string | null;
+  description?: string | null;
+}): Promise<void> => {
+  const vendor = await collections
+    .users()
+    .findOne({ _id: new ObjectId(input.vendorId) });
+  if (!vendor) return;
+
+  const document: TransactionDoc = {
+    _id: new ObjectId(),
+    vendorId: input.vendorId,
+    vendorName: vendor.name,
+    vendorEmail: vendor.email,
+    plan: input.plan ?? "premium",
+    amount: input.amount,
+    currency: input.currency.toUpperCase(),
+    status: input.status,
+    stripeEventId: input.eventId,
+    stripeSubscriptionId: input.subscriptionId ?? null,
+    description: input.description ?? null,
+    createdAt: new Date(),
+  };
+
+  // Idempotent by event id: a retried webhook never creates a duplicate.
+  await collections
+    .transactions()
     .updateOne(
       { stripeEventId: input.eventId },
       { $setOnInsert: document },
