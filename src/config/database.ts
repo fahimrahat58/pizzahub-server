@@ -1,3 +1,5 @@
+/// <reference path="../types/express/index.d.ts" />
+
 import { MongoClient, type Collection, type Db, type ObjectId } from "mongodb";
 
 import { env } from "./env.js";
