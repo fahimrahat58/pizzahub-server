@@ -136,6 +136,11 @@ export const createIndexes = async (): Promise<void> => {
       run: () => collections.reviews().createIndex({ menuItemId: 1, rating: -1 }),
     },
     {
+      name: "reviews.customer",
+      run: () =>
+        collections.reviews().createIndex({ customerId: 1, updatedAt: -1 }),
+    },
+    {
       name: "reviews.unique.restaurant",
       run: () =>
         collections

@@ -203,9 +203,13 @@ export interface FavoriteDoc {
   createdAt: Date;
 }
 
+export type RatingDistribution = Record<"1" | "2" | "3" | "4" | "5", number>;
+
 export interface ReviewDoc {
   _id: ObjectId;
   customerId: string;
+  /** Snapshot of the customer name so historical reviews keep an author. */
+  customerName?: string;
   /** Present for pizza reviews; absent for restaurant-only reviews. */
   menuItemId?: ObjectId;
   /** Present for restaurant reviews; absent for pizza-only reviews. */
@@ -213,6 +217,8 @@ export interface ReviewDoc {
   orderId: ObjectId;
   rating: number;
   comment: string;
+  /** Admin moderation flag. Hidden reviews are excluded from public ratings. */
+  isHidden?: boolean;
   createdAt: Date;
   updatedAt: Date;
 }

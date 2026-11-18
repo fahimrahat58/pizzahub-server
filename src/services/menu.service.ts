@@ -123,16 +123,45 @@ const ratingLookup = {
     localField: "_id",
     foreignField: "menuItemId",
     pipeline: [
+      // Admin-hidden reviews must not influence public product ratings.
+      { $match: { isHidden: { $ne: true } } },
       {
         $group: {
           _id: null,
           avg: { $avg: "$rating" },
           count: { $sum: 1 },
+          five: { $sum: { $cond: [{ $eq: ["$rating", 5] }, 1, 0] } },
+          four: { $sum: { $cond: [{ $eq: ["$rating", 4] }, 1, 0] } },
+          three: { $sum: { $cond: [{ $eq: ["$rating", 3] }, 1, 0] } },
+          two: { $sum: { $cond: [{ $eq: ["$rating", 2] }, 1, 0] } },
+          one: { $sum: { $cond: [{ $eq: ["$rating", 1] }, 1, 0] } },
+        },
+      },
+      {
+        $project: {
+          _id: 0,
+          avg: 1,
+          count: 1,
+          distribution: {
+            "5": "$five",
+            "4": "$four",
+            "3": "$three",
+            "2": "$two",
+            "1": "$one",
+          },
         },
       },
     ],
     as: "ratingInfo",
   },
+};
+
+const emptyRatingDistribution = {
+  "1": 0,
+  "2": 0,
+  "3": 0,
+  "4": 0,
+  "5": 0,
 };
 
 const ratingFields = {
@@ -142,6 +171,12 @@ const ratingFields = {
     },
     reviewCount: {
       $ifNull: [{ $arrayElemAt: ["$ratingInfo.count", 0] }, 0],
+    },
+    ratingDistribution: {
+      $ifNull: [
+        { $arrayElemAt: ["$ratingInfo.distribution", 0] },
+        emptyRatingDistribution,
+      ],
     },
   },
 };

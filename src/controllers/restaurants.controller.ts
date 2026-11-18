@@ -34,7 +34,12 @@ const ratingsForRestaurants = async (
   const rows = await collections
     .reviews()
     .aggregate<{ _id: ObjectId; ratingAvg: number; reviewCount: number }>([
-      { $match: { restaurantId: { $in: restaurants.map((item) => item._id) } } },
+      {
+        $match: {
+          restaurantId: { $in: restaurants.map((item) => item._id) },
+          isHidden: { $ne: true },
+        },
+      },
       {
         $group: {
           _id: "$restaurantId",

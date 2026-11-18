@@ -1,10 +1,14 @@
 import type { Request, Response } from "express";
-import type { Document } from "mongodb";
+import { ObjectId, type Document } from "mongodb";
+import { z } from "zod";
 
 import { collections } from "../config/database.js";
-import { asyncHandler } from "../utils/errors.js";
-import { getPagination, firstString } from "../utils/query.js";
-import { menuItemDto, orderDto, userDto } from "../utils/serialize.js";
+import { asyncHandler, notFound } from "../utils/errors.js";
+import { getPagination, firstString, isValidObjectId } from "../utils/query.js";
+import { menuItemDto, orderDto, reviewDto, userDto } from "../utils/serialize.js";
+import type { ReviewDoc } from "../types/models.js";
+
+const reviewModerationSchema = z.object({ hidden: z.boolean() }).strict();
 
 export const dashboardStats = asyncHandler(async (_req: Request, res: Response) => {
   const [
@@ -105,3 +109,104 @@ export const listTransactions = asyncHandler(
     });
   },
 );
+
+type AdminReviewRow = ReviewDoc & {
+  authorEmail?: string | null;
+  productName?: string | null;
+};
+
+/** Admin-only review moderation list, including hidden reviews. */
+export const listReviews = asyncHandler(async (req: Request, res: Response) => {
+  const { page, limit } = getPagination(req);
+  const search = firstString(req.query.search)?.trim();
+  const filter: Document = {};
+  if (search) {
+    const escaped = search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    filter.$or = [
+      { comment: { $regex: escaped, $options: "i" } },
+      { customerName: { $regex: escaped, $options: "i" } },
+    ];
+  }
+
+  const [reviews, total] = await Promise.all([
+    collections.reviews()
+      .aggregate<AdminReviewRow>([
+        { $match: filter },
+        {
+          $lookup: {
+            from: "users",
+            localField: "customerId",
+            foreignField: "_id",
+            pipeline: [{ $project: { name: 1, email: 1 } }],
+            as: "author",
+          },
+        },
+        {
+          $lookup: {
+            from: "menuItems",
+            localField: "menuItemId",
+            foreignField: "_id",
+            pipeline: [{ $project: { name: 1 } }],
+            as: "product",
+          },
+        },
+        {
+          $addFields: {
+            authorEmail: { $arrayElemAt: ["$author.email", 0] },
+            productName: { $arrayElemAt: ["$product.name", 0] },
+          },
+        },
+        { $project: { author: 0, product: 0 } },
+        { $sort: { createdAt: -1 } },
+        { $skip: (page - 1) * limit },
+        { $limit: limit },
+      ])
+      .toArray(),
+    collections.reviews().countDocuments(filter),
+  ]);
+
+  res.json({
+    success: true,
+    reviews: reviews.map((review) =>
+      reviewDto(review, {
+        includeCustomerId: true,
+        includeHidden: true,
+        customerEmail: review.authorEmail ?? null,
+        productName: review.productName ?? null,
+      }),
+    ),
+    pagination: { page, limit, total, pages: Math.ceil(total / limit) },
+  });
+});
+
+export const setReviewHidden = asyncHandler(
+  async (req: Request, res: Response) => {
+    if (!isValidObjectId(String(req.params.id))) throw notFound("Review not found");
+    const { hidden } = reviewModerationSchema.parse(req.body);
+    const updated = await collections.reviews().findOneAndUpdate(
+      { _id: new ObjectId(String(req.params.id)) },
+      { $set: { isHidden: hidden, updatedAt: new Date() } },
+      { returnDocument: "after" },
+    );
+    if (!updated) throw notFound("Review not found");
+
+    res.json({
+      success: true,
+      message: hidden ? "Review hidden" : "Review restored",
+      review: reviewDto(updated, {
+        includeCustomerId: true,
+        includeHidden: true,
+      }),
+    });
+  },
+);
+
+export const deleteReview = asyncHandler(async (req: Request, res: Response) => {
+  if (!isValidObjectId(String(req.params.id))) throw notFound("Review not found");
+  const deleted = await collections.reviews().findOneAndDelete({
+    _id: new ObjectId(String(req.params.id)),
+  });
+  if (!deleted) throw notFound("Review not found");
+
+  res.json({ success: true, message: "Review deleted by administrator" });
+});

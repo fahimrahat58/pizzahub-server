@@ -2,6 +2,7 @@ import type {
   FavoriteDoc,
   MenuItemDoc,
   OrderDoc,
+  RatingDistribution,
   RestaurantDoc,
   ReviewDoc,
   UserDoc,
@@ -52,10 +53,19 @@ type RestaurantSummarySource = {
 type MenuEnrichment = {
   ratingAvg?: number;
   reviewCount?: number;
+  ratingDistribution?: RatingDistribution;
   restaurantInfo?: RestaurantSummarySource[];
   restaurant?: RestaurantSummarySource | null;
   vendorName?: string | null;
 };
+
+const emptyRatingDistribution = (): RatingDistribution => ({
+  "1": 0,
+  "2": 0,
+  "3": 0,
+  "4": 0,
+  "5": 0,
+});
 
 const restaurantSummary = (
   source?: RestaurantSummarySource | null,
@@ -109,6 +119,7 @@ export const menuItemDto = (
     rejectionReason: item.rejectionReason ?? null,
     ratingAvg: enriched.ratingAvg ?? 0,
     reviewCount: enriched.reviewCount ?? 0,
+    ratingDistribution: enriched.ratingDistribution ?? emptyRatingDistribution(),
     createdAt: item.createdAt,
     updatedAt: item.updatedAt,
   };
@@ -165,14 +176,36 @@ export const favoriteDto = (favorite: FavoriteDoc) => ({
   createdAt: favorite.createdAt,
 });
 
-export const reviewDto = (review: ReviewDoc) => ({
+type ReviewDtoOptions = {
+  /** Only privileged/private views should expose the internal customer id. */
+  includeCustomerId?: boolean;
+  /** Admin/vendor views can surface the moderation state. */
+  includeHidden?: boolean;
+  customerEmail?: string | null;
+  productName?: string | null;
+  restaurantName?: string | null;
+};
+
+export const reviewDto = (
+  review: ReviewDoc,
+  options: ReviewDtoOptions = {},
+) => ({
   id: id(review),
-  customerId: review.customerId,
+  ...(options.includeCustomerId ? { customerId: review.customerId } : {}),
+  customerName: review.customerName ?? null,
   menuItemId: review.menuItemId?.toHexString() ?? null,
   restaurantId: review.restaurantId?.toHexString() ?? null,
   orderId: review.orderId.toHexString(),
   rating: review.rating,
   comment: review.comment,
+  ...(options.includeHidden ? { isHidden: review.isHidden ?? false } : {}),
+  ...(options.customerEmail !== undefined
+    ? { customerEmail: options.customerEmail }
+    : {}),
+  ...(options.productName !== undefined ? { productName: options.productName } : {}),
+  ...(options.restaurantName !== undefined
+    ? { restaurantName: options.restaurantName }
+    : {}),
   createdAt: review.createdAt,
   updatedAt: review.updatedAt,
 });
