@@ -4,7 +4,10 @@ import { ObjectId, type Document } from "mongodb";
 import { z } from "zod";
 
 import { collections } from "../config/database.js";
-import { sendOrderStatusEmail } from "../services/email.service.js";
+import {
+  sendNewOrderEmails,
+  sendOrderStatusEmail,
+} from "../services/email.service.js";
 import {
   asyncHandler,
   badRequest,
@@ -156,10 +159,37 @@ export const createOrder = asyncHandler(async (req: Request, res: Response) => {
     throw error;
   }
 
+  // Email is a side effect of a successfully stored order. The service never
+  // throws, but this guard keeps a provider outage from changing the API result.
+  let email: Awaited<ReturnType<typeof sendNewOrderEmails>> | undefined;
+  try {
+    email = await sendNewOrderEmails({
+      vendorEmail: vendor.email,
+      vendorName: vendor.businessName?.trim() || vendor.name,
+      customerName: order.customerSnapshot.name,
+      customerEmail: order.customerSnapshot.email,
+      orderNumber: order.orderNumber,
+      itemName: order.menuItemSnapshot.name,
+      restaurantName: restaurant?.name ?? order.menuItemSnapshot.restaurantName,
+      quantity: order.quantity,
+      unitPrice: order.unitPrice,
+      totalPrice: order.totalPrice,
+      deliveryAddress: order.deliveryAddress,
+      deliveryDate: order.deliveryDate,
+      message: order.message,
+    });
+  } catch (caught) {
+    console.error(
+      "[email] Unexpected new-order email failure:",
+      caught instanceof Error ? caught.message : "unknown error",
+    );
+  }
+
   res.status(201).json({
     success: true,
     message: "Order placed successfully",
     order: orderDto(order),
+    ...(email ? { email } : {}),
   });
 });
 
@@ -269,7 +299,9 @@ const changeStatus = async (
 ) => {
   const order = await findOrderForRequest(req);
   if (!allowedFrom.includes(order.status)) {
-    throw conflict(`This order cannot be ${note.toLowerCase()} from status "${order.status}"`);
+    throw conflict(
+      `This order cannot be updated from status "${order.status}" to "${nextStatus}"`,
+    );
   }
   if (req.user!.role !== by && !(by === "vendor" && req.user!.role === "vendor")) {
     throw forbidden("You cannot perform this action");
@@ -295,7 +327,7 @@ const changeStatus = async (
     updated.menuItemSnapshot.restaurantName ??
     null;
 
-  let email: { sent: boolean; warning?: string } = { sent: false };
+  let email: { sent: boolean; warning?: string } | undefined;
   if (nextStatus === "accepted" || nextStatus === "rejected") {
     email = await sendOrderStatusEmail({
       to: updated.customerSnapshot.email,
@@ -311,9 +343,9 @@ const changeStatus = async (
 
   res.json({
     success: true,
-    message: `Order ${note.toLowerCase()}`,
+    message: note,
     order: orderDto(updated, restaurantName ?? undefined),
-    email,
+    ...(email ? { email } : {}),
   });
 };
 

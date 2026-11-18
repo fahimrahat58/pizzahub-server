@@ -1,6 +1,6 @@
 # PizzaHub Server
 
-Express 5 + TypeScript API for PizzaHub. It stores marketplace data in MongoDB, verifies Better Auth JWTs through JWKS, proxies ImgBB uploads, sends order-status email through Resend, and handles Stripe Checkout webhooks for vendor Premium subscriptions.
+Express 5 + TypeScript API for PizzaHub. It stores marketplace data in MongoDB, verifies Better Auth JWTs through JWKS, proxies ImgBB uploads, sends new-order and order-status email through the Resend SDK, and handles Stripe Checkout webhooks for vendor Premium subscriptions.
 
 ## Quick start
 
@@ -31,9 +31,9 @@ Scripts:
 | `IMGBB_API_KEY` | Server-only upload key. |
 | `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET` | Stripe TEST credentials for Premium billing. |
 | `STRIPE_PRICE_ID_MONTHLY`, `STRIPE_PRICE_ID_YEARLY` | Stripe Price IDs (`price_...`), not Product IDs. |
-| `RESEND_API_KEY`, `EMAIL_FROM` | Order accepted/rejected email delivery. |
+| `RESEND_API_KEY`, `EMAIL_FROM` | New-order vendor/customer notifications and accepted/rejected status email. |
 
-Stripe and email credentials are optional at startup. Billing endpoints return a clear 503 when Stripe is incomplete; email delivery logs a warning when Resend is not configured but never blocks an order transition.
+Stripe and email credentials are optional at startup. Billing endpoints return a clear 503 when Stripe is incomplete; email delivery logs a warning when Resend is not configured but never blocks an order transition or a status change.
 
 ## Route groups
 
@@ -66,7 +66,7 @@ The client's `src/lib/api.ts` fetches `/api/auth/token`, caches it until near ex
 
 ## Emails and webhooks
 
-`POST /api/orders/:id/accept` and `/reject` append a timeline entry and call the Resend REST API with the customer email captured on the order. Configure `RESEND_API_KEY` and a verified `EMAIL_FROM` in production.
+`POST /api/orders` stores the order and then uses `sendNewOrderEmails` from `src/services/email.service.ts` to notify the vendor and confirm to the customer with the `resend` SDK. `POST /api/orders/:id/accept` and `/reject` use the same service to email the customer a status update. Both flows read recipients from MongoDB snapshots, never from the request body, and return `email: { sent, warning? }` results without changing the order outcome when delivery fails. Configure `RESEND_API_KEY` and a verified `EMAIL_FROM` in production.
 
 Stripe Checkout is redirect-based. The browser never activates Premium itself: `POST /api/webhooks/stripe` verifies the signature, records the event id for idempotency, and only then updates the subscription. Price IDs are server-side; product IDs are rejected at startup checks.
 

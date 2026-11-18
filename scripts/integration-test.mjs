@@ -1012,8 +1012,11 @@ try {
   const created = await api("customer", "POST", "/api/orders", orderPayload, 201);
   const order = created.order;
   assert.equal(order.status, "pending");
+  assert.ok(created.email, "new order response must include email results");
+  assert.equal(typeof created.email.vendor.sent, "boolean");
+  assert.equal(typeof created.email.customer.sent, "boolean");
   await api("customer", "POST", "/api/orders", orderPayload, 409);
-  pass("Order creation works and blocks duplicate active orders");
+  pass("Order creation stores the order, returns email status, and blocks duplicates");
 
   const vendorOrders = await api("vendor", "GET", "/api/orders/vendor?limit=100");
   assert.ok(vendorOrders.orders.some((entry) => entry.id === order.id));
