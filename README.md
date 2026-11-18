@@ -23,6 +23,7 @@ Scripts:
 
 | Variable | Purpose |
 | --- | --- |
+| `NODE_ENV` | Set to `development` locally to enable the Resend test recipient. |
 | `PORT` | Express port, default `5000`. |
 | `FRONTEND_URL` | Comma-separated allowed CORS origins. |
 | `MONGODB_URI`, `DB_NAME` | MongoDB connection and database name. |
@@ -32,8 +33,9 @@ Scripts:
 | `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET` | Stripe TEST credentials for Premium billing. |
 | `STRIPE_PRICE_ID_MONTHLY`, `STRIPE_PRICE_ID_YEARLY` | Stripe Price IDs (`price_...`), not Product IDs. |
 | `RESEND_API_KEY`, `EMAIL_FROM` | New-order vendor/customer notifications and accepted/rejected status email. |
+| `RESEND_TEST_EMAIL` | Development-only verified recipient that replaces both vendor and customer addresses when `NODE_ENV=development`. Ignored in production. |
 
-Stripe and email credentials are optional at startup. Billing endpoints return a clear 503 when Stripe is incomplete; email delivery logs a warning when Resend is not configured but never blocks an order transition or a status change.
+Stripe and email credentials are optional at startup. Billing endpoints return a clear 503 when Stripe is incomplete; email delivery logs a warning when Resend is not configured but never blocks an order transition or a status change. Stored MongoDB emails are never modified for testing.
 
 ## Route groups
 
@@ -67,6 +69,8 @@ The client's `src/lib/api.ts` fetches `/api/auth/token`, caches it until near ex
 ## Emails and webhooks
 
 `POST /api/orders` stores the order and then uses `sendNewOrderEmails` from `src/services/email.service.ts` to notify the vendor and confirm to the customer with the `resend` SDK. `POST /api/orders/:id/accept` and `/reject` use the same service to email the customer a status update. Both flows read recipients from MongoDB snapshots, never from the request body, and return `email: { sent, warning? }` results without changing the order outcome when delivery fails. Configure `RESEND_API_KEY` and a verified `EMAIL_FROM` in production.
+
+For local testing with onboarding/sandbox senders, set `NODE_ENV=development` and `RESEND_TEST_EMAIL=<verified-address>` in `pizzahub-server/.env`. The service then sends both new-order emails to that verified address while preserving the original order data and templates; production recipients are never overridden. Server logs state whether each message went to the `development test recipient (RESEND_TEST_EMAIL)` or the `original recipient`, including the resolved address, and never print the API key. A Resend 422 (unverified recipient) is returned as `email: { sent: false, warning: "Email provider rejected the message" }`; the order still succeeds.
 
 Stripe Checkout is redirect-based. The browser never activates Premium itself: `POST /api/webhooks/stripe` verifies the signature, records the event id for idempotency, and only then updates the subscription. Price IDs are server-side; product IDs are rejected at startup checks.
 

@@ -24,6 +24,8 @@ const stripePriceIdMonthly = process.env.STRIPE_PRICE_ID_MONTHLY?.trim() ?? "";
 const stripePriceIdYearly = process.env.STRIPE_PRICE_ID_YEARLY?.trim() ?? "";
 const resendApiKey = process.env.RESEND_API_KEY?.trim() ?? "";
 const emailFrom = process.env.EMAIL_FROM?.trim() ?? "";
+const nodeEnv = process.env.NODE_ENV?.trim() ?? "";
+const resendTestEmail = process.env.RESEND_TEST_EMAIL?.trim() ?? "";
 
 const isPlaceholder = (value: string): boolean =>
   value.length === 0 ||
@@ -45,6 +47,8 @@ export const env = {
   stripePriceIdYearly,
   resendApiKey,
   emailFrom,
+  nodeEnv,
+  resendTestEmail,
 } as const;
 
 export const isImgBbConfigured = (): boolean =>
@@ -56,6 +60,19 @@ export const isEmailConfigured = (): boolean =>
   !isPlaceholder(env.resendApiKey) &&
   !isPlaceholder(env.emailFrom) &&
   env.emailFrom.includes("@");
+
+/**
+ * Development-only Resend recipient. This is deliberately gated on NODE_ENV so
+ * a verified test address can never replace real vendor/customer recipients in
+ * production. Placeholder values are ignored.
+ */
+export const getDevelopmentEmailRecipient = (): string | null => {
+  if (env.nodeEnv !== "development") return null;
+  if (isPlaceholder(env.resendTestEmail) || !env.resendTestEmail.includes("@")) {
+    return null;
+  }
+  return env.resendTestEmail;
+};
 
 /** True only when all four Stripe values are present and non-placeholder. */
 export const isStripeConfigured = (): boolean =>

@@ -1,6 +1,10 @@
 import { Resend } from "resend";
 
-import { env, isEmailConfigured } from "../config/env.js";
+import {
+  env,
+  getDevelopmentEmailRecipient,
+  isEmailConfigured,
+} from "../config/env.js";
 
 export type EmailResult = { sent: boolean; warning?: string };
 
@@ -92,11 +96,24 @@ const sendEmail = async (
     return { sent: false, warning: "Email is not configured" };
   }
 
+  // Only development may redirect mail to a verified test inbox. Production
+  // always uses the recipient derived from the order/vendor document.
+  const testRecipient = getDevelopmentEmailRecipient();
+  const recipient = testRecipient ?? email.to;
+  const recipientSource = testRecipient
+    ? "development test recipient (RESEND_TEST_EMAIL)"
+    : "original recipient";
+  console.info(
+    `[email] ${label}: sending to ${recipientSource} <${recipient}>${
+      testRecipient ? ` instead of original recipient <${email.to}>` : ""
+    }`,
+  );
+
   try {
     const { data, error } = await getResendClient().emails.send(
       {
         from: env.emailFrom,
-        to: [email.to],
+        to: [recipient],
         subject: email.subject,
         html: email.html,
         text: email.text,
@@ -107,20 +124,25 @@ const sendEmail = async (
     if (error) {
       const status = error.statusCode ?? "unknown";
       console.error(
-        `[email] Resend rejected ${label} email (${status}): ${error.message}`,
+        `[email] Resend rejected ${label} email for ${recipientSource} <${recipient}> (${status}): ${error.message}`,
       );
       return { sent: false, warning: "Email provider rejected the message" };
     }
 
     if (!data?.id) {
-      console.error(`[email] Resend returned no message id for ${label} email`);
+      console.error(
+        `[email] Resend returned no message id for ${label} email to ${recipientSource} <${recipient}>`,
+      );
       return { sent: false, warning: "Email provider returned no confirmation" };
     }
 
+    console.info(
+      `[email] ${label}: delivered to ${recipientSource} <${recipient}> (message ${data.id})`,
+    );
     return { sent: true };
   } catch (caught) {
     console.error(
-      `[email] Failed to send ${label} email:`,
+      `[email] Failed to send ${label} email to ${recipientSource} <${recipient}>:`,
       caught instanceof Error ? caught.message : "unknown error",
     );
     return { sent: false, warning: "Email provider unavailable" };
