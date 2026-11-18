@@ -1,72 +1,86 @@
 import "dotenv/config";
 
-import cors from "cors";
-import express from "express";
+import type { IncomingMessage, ServerResponse } from "node:http";
 
+import app from "./app.js";
 import { connectDB } from "./config/database.js";
 import { createIndexes } from "./config/indexes.js";
 import { migrateMenuPublishing } from "./config/migrations.js";
 import { env } from "./config/env.js";
-import { errorHandler } from "./utils/errors.js";
 
-import testRoutes from "./routes/test.routes.js";
-import authRoutes from "./routes/auth.routes.js";
-import userRoutes from "./routes/users.routes.js";
-import restaurantRoutes from "./routes/restaurants.routes.js";
-import menuRoutes from "./routes/menu.routes.js";
-import orderRoutes from "./routes/orders.routes.js";
-import favoriteRoutes from "./routes/favorites.routes.js";
-import reviewRoutes from "./routes/reviews.routes.js";
-import adminRoutes from "./routes/admin.routes.js";
-import uploadRoutes from "./routes/uploads.routes.js";
-import subscriptionRoutes from "./routes/subscriptions.routes.js";
-import webhookRoutes from "./routes/webhooks.routes.js";
+/**
+ * Serverless functions reuse the same module instance, so initialization is
+ * cached. A failed attempt is cleared so the next invocation can retry.
+ */
+let initialization: Promise<void> | undefined;
 
-const app = express();
+const initialize = (): Promise<void> => {
+  if (!initialization) {
+    initialization = (async () => {
+      await connectDB();
+      await createIndexes();
+      await migrateMenuPublishing();
+    })().catch((error: unknown) => {
+      initialization = undefined;
+      throw error;
+    });
+  }
+  return initialization;
+};
 
-app.use(
-  cors({
-    origin: env.frontendUrl.split(",").map((origin) => origin.trim()),
-    credentials: true,
-  }),
-);
-// Stripe needs the untouched request body for signature verification, so this
-// route is registered BEFORE express.json().
-app.use("/api/webhooks", webhookRoutes);
+const handleRequest = (
+  req: IncomingMessage,
+  res: ServerResponse,
+): Promise<void> =>
+  new Promise<void>((resolve, reject) => {
+    const cleanup = (): void => {
+      res.off("finish", onFinish);
+      res.off("close", onClose);
+      res.off("error", onError);
+    };
 
-app.use(express.json({ limit: "8mb" }));
+    const onFinish = (): void => {
+      cleanup();
+      resolve();
+    };
 
-app.get("/", (_req, res) => {
-  res.json({ success: true, message: "PizzaHub API is running!" });
-});
+    const onClose = (): void => {
+      cleanup();
+      resolve();
+    };
 
-app.get("/api/health", (_req, res) => {
-  res.json({ success: true, message: "Server is healthy" });
-});
+    const onError = (error: Error): void => {
+      cleanup();
+      reject(error);
+    };
 
-app.use("/api/test", testRoutes);
-app.use("/api/auth", authRoutes);
-app.use("/api/users", userRoutes);
-app.use("/api/restaurants", restaurantRoutes);
-app.use("/api/menu", menuRoutes);
-app.use("/api/orders", orderRoutes);
-app.use("/api/favorites", favoriteRoutes);
-app.use("/api/reviews", reviewRoutes);
-app.use("/api/admin", adminRoutes);
-app.use("/api/uploads", uploadRoutes);
-app.use("/api/subscriptions", subscriptionRoutes);
+    res.once("finish", onFinish);
+    res.once("close", onClose);
+    res.once("error", onError);
 
-app.use((_req, res) => {
-  res.status(404).json({ success: false, message: "Endpoint not found" });
-});
+    try {
+      app(req, res);
+    } catch (error) {
+      cleanup();
+      reject(error);
+    }
+  });
 
-app.use(errorHandler);
+/** Vercel invokes this exported function instead of starting an HTTP listener. */
+export const handler = async (
+  req: IncomingMessage,
+  res: ServerResponse,
+): Promise<void> => {
+  await initialize();
+  await handleRequest(req, res);
+};
 
+export default handler;
+
+/** Local development still uses `app.listen()`. */
 const startServer = async (): Promise<void> => {
   try {
-    await connectDB();
-    await createIndexes();
-    await migrateMenuPublishing();
+    await initialize();
     app.listen(env.port, () => {
       console.log(`PizzaHub server running on port ${env.port}`);
     });
@@ -76,4 +90,6 @@ const startServer = async (): Promise<void> => {
   }
 };
 
-void startServer();
+if (process.env.VERCEL !== "1") {
+  void startServer();
+}
