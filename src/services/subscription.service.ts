@@ -6,6 +6,7 @@ import { env } from "../config/env.js";
 import { isValidObjectId } from "../utils/query.js";
 import type {
   BillingInterval,
+  CheckoutLockDoc,
   BillingPlanId,
   StoredSubscriptionPlan,
   SubscriptionEventDoc,
@@ -66,7 +67,9 @@ type SubscriptionState = Pick<
   | "subscriptionPlan"
   | "subscriptionStatus"
   | "subscriptionExpiresAt"
+  | "cancelAt"
   | "cancelAtPeriodEnd"
+  | "endedAt"
   | "canceledAt"
 >;
 
@@ -81,10 +84,11 @@ export const getEffectiveSubscription = (
   const status = user.subscriptionStatus ?? null;
   const expiresAt = user.subscriptionExpiresAt ?? null;
   const expired = expiresAt !== null && expiresAt.getTime() <= Date.now();
+  const ended = user.endedAt != null;
 
   // Pre-Stripe `pro` users have no status/expiry; keep them Premium.
   const active = status ? isActiveSubscriptionStatus(status) : plan === "premium";
-  const isPremium = active && !expired;
+  const isPremium = active && !expired && !ended;
 
   return {
     plan: isPremium ? "premium" : "free",
@@ -94,7 +98,7 @@ export const getEffectiveSubscription = (
     isPremium,
     expiresAt,
     cancelAtPeriodEnd: isPremium && (user.cancelAtPeriodEnd ?? false),
-    canceledAt: user.canceledAt ?? null,
+    canceledAt: user.endedAt ?? user.canceledAt ?? null,
     activeItemLimit: isPremium ? null : FREE_ITEM_LIMIT,
     activeRestaurantLimit: isPremium ? null : FREE_RESTAURANT_LIMIT,
   };
@@ -116,8 +120,10 @@ type StripeSubscriptionState = Pick<
   | "customer"
   | "status"
   | "metadata"
+  | "cancel_at"
   | "cancel_at_period_end"
   | "canceled_at"
+  | "ended_at"
   | "items"
 >;
 
@@ -127,6 +133,8 @@ export type SubscriptionSyncInput = StripeSubscriptionState & {
   checkoutSessionId?: string | null;
   /** Invoice events do not carry this flag, so keep the stored value. */
   preserveCancelAtPeriodEnd?: boolean;
+  /** Live status reconciliation must not advance the webhook event watermark. */
+  preserveEventMetadata?: boolean;
   /** subscription.deleted is authoritative even if Stripe's snapshot lags. */
   statusOverride?: SubscriptionStatus;
 };
@@ -157,6 +165,16 @@ const periodEndOf = (subscription: StripeSubscriptionState): number => {
     .filter((value): value is number => typeof value === "number");
   return ends.length > 0 ? Math.max(...ends) : 0;
 };
+
+const cancelAtOf = (subscription: StripeSubscriptionState): number | null =>
+  typeof subscription.cancel_at === "number" && Number.isFinite(subscription.cancel_at)
+    ? subscription.cancel_at
+    : null;
+
+const endedAtOf = (subscription: StripeSubscriptionState): number | null =>
+  typeof subscription.ended_at === "number" && Number.isFinite(subscription.ended_at)
+    ? subscription.ended_at
+    : null;
 
 const customerIdOf = (customer: string | { id: string } | Stripe.DeletedCustomer): string =>
   typeof customer === "string" ? customer : customer.id;
@@ -274,6 +292,7 @@ export const syncSubscription = async (
     eventCreated,
     checkoutSessionId,
     preserveCancelAtPeriodEnd,
+    preserveEventMetadata,
     statusOverride,
     ...subscription
   } = input;
@@ -288,7 +307,10 @@ export const syncSubscription = async (
     return null;
   }
 
-  const status = statusOverride ?? normalizeStripeStatus(subscription.status);
+  const endedAt = endedAtOf(subscription);
+  const status =
+    statusOverride ??
+    (endedAt !== null ? "canceled" : normalizeStripeStatus(subscription.status));
   const incomingActive = isActiveSubscriptionStatus(status);
   const replacingSubscription =
     Boolean(vendor.stripeSubscriptionId) && vendor.stripeSubscriptionId !== subscription.id;
@@ -316,6 +338,17 @@ export const syncSubscription = async (
   const plan: SubscriptionPlan = incomingActive ? "premium" : "free";
   const periodStart = periodStartOf(subscription);
   const periodEnd = periodEndOf(subscription);
+  const cancelAt = cancelAtOf(subscription);
+  const isTerminal = isTerminalSubscriptionStatus(status) || endedAt !== null;
+  const scheduledCancellation =
+    subscription.cancel_at_period_end === true || cancelAt !== null;
+
+  // Stripe's cancel_at can move the effective end earlier than the invoice
+  // period. ended_at is authoritative once the subscription has actually ended.
+  const effectivePeriodEnd = [periodEnd, cancelAt, endedAt]
+    .filter((value): value is number => typeof value === "number" && value > 0)
+    .reduce<number | null>((earliest, value) => (earliest === null ? value : Math.min(earliest, value)), null);
+
   const billingInterval = billingIntervalOf(subscription) ?? vendor.billingInterval ?? null;
   const billingPlanId: BillingPlanId | null =
     billingInterval === "month"
@@ -323,7 +356,13 @@ export const syncSubscription = async (
       : billingInterval === "year"
         ? "yearly"
         : billingPlanIdOf(subscription.metadata) ?? vendor.billingPlanId ?? null;
-  const canceledAtSeconds = subscription.canceled_at ?? (status === "canceled" ? eventSeconds : null);
+
+  // While a cancellation is only scheduled, Stripe's canceled_at may already
+  // contain the request time. Do not show the subscription as canceled until
+  // ended_at or a terminal status proves it actually ended.
+  const canceledAtSeconds = isTerminal
+    ? endedAt ?? subscription.canceled_at ?? eventSeconds
+    : null;
   const canceledAt = canceledAtSeconds ? new Date(canceledAtSeconds * 1000) : null;
 
   // Build an atomic guard from the vendor snapshot we just validated. Every
@@ -351,13 +390,20 @@ export const syncSubscription = async (
   });
 
   // A renewal cannot move the period end backwards for the same subscription.
-  // A brand-new subscription replacing a canceled one is allowed to differ.
-  if (!replacingSubscription && periodEnd > 0) {
+  // A brand-new subscription replacing a canceled one is allowed to differ, as
+  // is a newer cancellation event, which legitimately shortens the effective
+  // end via cancel_at/ended_at. Event age already prevents out-of-order writes.
+  if (
+    !replacingSubscription &&
+    !scheduledCancellation &&
+    !isTerminal &&
+    effectivePeriodEnd !== null
+  ) {
     conditions.push({
       $or: [
         { subscriptionExpiresAt: { $exists: false } },
         { subscriptionExpiresAt: null },
-        { subscriptionExpiresAt: { $lte: new Date(periodEnd * 1000) } },
+        { subscriptionExpiresAt: { $lte: new Date(effectivePeriodEnd * 1000) } },
       ],
     });
   }
@@ -376,13 +422,20 @@ export const syncSubscription = async (
       stripeCheckoutSessionId: checkoutSessionId ?? vendor.stripeCheckoutSessionId ?? null,
       currentPeriodStart: periodStart > 0 ? new Date(periodStart * 1000) : null,
       currentPeriodEnd: periodEnd > 0 ? new Date(periodEnd * 1000) : null,
-      subscriptionExpiresAt: periodEnd > 0 ? new Date(periodEnd * 1000) : null,
+      subscriptionExpiresAt:
+        effectivePeriodEnd !== null ? new Date(effectivePeriodEnd * 1000) : null,
+      cancelAt: cancelAt !== null ? new Date(cancelAt * 1000) : null,
       cancelAtPeriodEnd: preserveCancelAtPeriodEnd
         ? vendor.cancelAtPeriodEnd ?? false
-        : subscription.cancel_at_period_end === true,
+        : !isTerminal && scheduledCancellation,
+      endedAt: endedAt !== null ? new Date(endedAt * 1000) : null,
       canceledAt,
-      subscriptionEventCreatedAt: eventAt,
-      subscriptionEventId: eventId ?? null,
+      subscriptionEventCreatedAt: preserveEventMetadata
+        ? vendor.subscriptionEventCreatedAt ?? null
+        : eventAt,
+      subscriptionEventId: preserveEventMetadata
+        ? vendor.subscriptionEventId ?? null
+        : eventId ?? null,
       updatedAt: new Date(),
     },
   });
@@ -391,6 +444,9 @@ export const syncSubscription = async (
     eventId: eventId ?? null,
     subscriptionId: subscription.id,
     vendorId: vendor._id.toHexString(),
+    status,
+    billingInterval,
+    cancelAtPeriodEnd: !isTerminal && scheduledCancellation,
     matchedCount: updateResult.matchedCount,
     modifiedCount: updateResult.modifiedCount,
   });
@@ -569,6 +625,64 @@ export const completeStripeEvent = async (eventId: string): Promise<void> => {
 /** Releases a claim on failure so Stripe can retry the webhook. */
 export const releaseStripeEvent = async (eventId: string): Promise<void> => {
   await collections.stripeEvents().deleteOne({ _id: eventId });
+};
+
+// Long enough to cover an in-flight API call, short enough that an abandoned
+// Checkout Session cannot block a legitimate retry for long.
+const CHECKOUT_LOCK_TTL_MS = 60_000;
+
+/**
+ * Atomically claims a short-lived checkout mutex for one vendor. The lock only
+ * prevents simultaneous Checkout Sessions; Stripe remains authoritative for
+ * whether a real subscription exists.
+ */
+export const acquireCheckoutLock = async (
+  vendorId: string,
+  plan: BillingPlanId,
+): Promise<boolean> => {
+  const now = new Date();
+  const document: CheckoutLockDoc = {
+    _id: vendorId,
+    vendorId,
+    plan,
+    sessionId: null,
+    createdAt: now,
+    expiresAt: new Date(now.getTime() + CHECKOUT_LOCK_TTL_MS),
+  };
+
+  try {
+    await collections.checkoutLocks().insertOne(document);
+    return true;
+  } catch (error) {
+    if (!(error instanceof MongoServerError) || error.code !== 11000) throw error;
+
+    // A stale lock may block a legitimate new purchase. Replace it only when
+    // MongoDB confirms it has expired; a live lock always wins.
+    const result = await collections.checkoutLocks().updateOne(
+      { _id: vendorId, expiresAt: { $lte: now } },
+      { $set: document },
+    );
+    return result.modifiedCount > 0;
+  }
+};
+
+export const markCheckoutLockSession = async (
+  vendorId: string,
+  sessionId: string,
+): Promise<void> => {
+  await collections
+    .checkoutLocks()
+    .updateOne({ _id: vendorId }, { $set: { sessionId } });
+};
+
+export const releaseCheckoutLock = async (
+  vendorId: string,
+  sessionId?: string | null,
+): Promise<void> => {
+  await collections.checkoutLocks().deleteOne({
+    _id: vendorId,
+    ...(sessionId ? { sessionId } : {}),
+  });
 };
 
 export const recordSubscriptionEvent = async (input: {

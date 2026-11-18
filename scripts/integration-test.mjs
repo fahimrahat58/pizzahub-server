@@ -149,6 +149,19 @@ const api = async (actor, method, path, body, expected = 200) => {
   return data;
 };
 
+// Like `api`, but returns the status instead of asserting it. Used where the
+// order of competing requests decides which status is expected.
+const rawApi = async (actor, method, path, body) => {
+  const headers = { "content-type": "application/json" };
+  if (actor) headers.authorization = `Bearer ${tokens.get(actor)}`;
+  const response = await fetch(`${API}${path}`, {
+    method,
+    headers,
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+  });
+  return { status: response.status, data: await json(response) };
+};
+
 const rawProtected = async (token, path = "/api/test/protected") => {
   const response = await fetch(`${API}${path}`, {
     headers: token ? { authorization: `Bearer ${token}` } : {},
@@ -167,6 +180,30 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 const webhookEventIds = [];
 const checkoutSessionIds = [];
 
+// Abandoning a Checkout Session must release the short-lived duplicate-checkout
+// guard so a vendor can immediately start a new purchase.
+const expireCheckout = async (sessionId, vendorId, customerId) => {
+  const eventId = `evt_it_expired_${sessionId.slice(-8)}_${suffix}`;
+  webhookEventIds.push(eventId);
+  const result = await sendWebhook({
+    id: eventId,
+    object: "event",
+    api_version: "2025-03-31.basil",
+    type: "checkout.session.expired",
+    created: Math.floor(Date.now() / 1000),
+    data: {
+      object: {
+        id: sessionId,
+        object: "checkout.session",
+        customer: customerId,
+        client_reference_id: vendorId,
+        metadata: { vendorId, plan: "monthly" },
+      },
+    },
+  });
+  assert.equal(result.response.status, 200, JSON.stringify(result.data));
+};
+
 const subscriptionEvent = (
   eventId,
   {
@@ -176,6 +213,8 @@ const subscriptionEvent = (
     periodEnd,
     periodStart = periodEnd - 30 * 24 * 60 * 60,
     canceledAt = null,
+    cancelAt = null,
+    endedAt = null,
     vendorId,
     plan = "monthly",
     priceId = monthlyPriceId,
@@ -197,8 +236,10 @@ const subscriptionEvent = (
       customer,
       status,
       metadata: { vendorId, plan },
+      cancel_at: cancelAt,
       cancel_at_period_end: cancelAtPeriodEnd,
       canceled_at: canceledAt,
+      ended_at: endedAt,
       items: {
         object: "list",
         data: [
@@ -913,11 +954,17 @@ try {
   );
   pass("Checkout rejects invalid plans and any frontend-supplied Price ID");
 
-  const checkout = await api("vendor", "POST", "/api/subscriptions/create-checkout-session", {
-    plan: "monthly",
-  });
+  const competingCheckouts = await Promise.all([
+    rawApi("vendor", "POST", "/api/subscriptions/create-checkout-session", { plan: "monthly" }),
+    rawApi("vendor", "POST", "/api/subscriptions/create-checkout-session", { plan: "monthly" }),
+  ]);
+  assert.deepEqual(competingCheckouts.map((entry) => entry.status).sort(), [200, 409]);
+  const checkout = competingCheckouts.find((entry) => entry.status === 200).data;
+  const blockedCheckout = competingCheckouts.find((entry) => entry.status === 409);
+  assert.match(blockedCheckout.data.message, /checkout is already in progress/i);
   checkoutSessionIds.push(checkout.sessionId);
   assert.match(checkout.url, /^https:\/\/checkout\.stripe\.com\//);
+  pass("Simultaneous checkout requests create at most one Checkout Session");
   const stripeSession = await stripe.checkout.sessions.retrieve(checkout.sessionId, {
     expand: ["line_items"],
   });
@@ -940,6 +987,8 @@ try {
   assert.equal(customerStatus.subscription.stripeCustomerId, stripeCustomerId);
   pass("Stripe checkout uses the server Price ID, vendor metadata, and Stripe-controlled URLs");
 
+  await expireCheckout(checkout.sessionId, vendor.id, stripeCustomerId);
+
   const yearlyCheckout = await api("vendor", "POST", "/api/subscriptions/create-checkout-session", {
     plan: "yearly",
   });
@@ -950,6 +999,8 @@ try {
   assert.equal(yearlySession.line_items?.data?.[0]?.price?.id, yearlyPriceId);
   assert.equal(yearlySession.metadata?.plan, "yearly");
   pass("Yearly checkout selects the yearly Price ID from the server environment");
+
+  await expireCheckout(yearlyCheckout.sessionId, vendor.id, stripeCustomerId);
 
   const portal = await api("vendor", "POST", "/api/subscriptions/create-portal-session");
   assert.match(portal.url, /^https:\/\/billing\.stripe\.com\//);
@@ -1202,6 +1253,7 @@ try {
       customer: stripeCustomerId,
       status: "active",
       cancelAtPeriodEnd: true,
+      cancelAt: futurePeriod - 60 * 60,
       periodEnd: futurePeriod,
       periodStart: currentPeriodStart,
       canceledAt: null,
@@ -1218,8 +1270,17 @@ try {
     new Date(cancelScheduled.subscription.currentPeriodEnd).getTime(),
     futurePeriod * 1000,
   );
+  assert.equal(
+    new Date(cancelScheduled.subscription.cancelAt).getTime(),
+    (futurePeriod - 60 * 60) * 1000,
+  );
+  assert.equal(
+    new Date(cancelScheduled.subscription.subscriptionExpiresAt).getTime(),
+    (futurePeriod - 60 * 60) * 1000,
+  );
   assert.equal(cancelScheduled.subscription.canceledAt, null);
-  pass("cancel_at_period_end keeps Premium and the purchased cycle until the period ends");
+  assert.equal(cancelScheduled.subscription.endedAt, null);
+  pass("cancel_at and cancel_at_period_end keep Premium until the scheduled end");
 
   // Simulate time passing past the stored period end without touching the API.
   await db.collection("users").updateOne(
@@ -1299,6 +1360,7 @@ try {
       periodEnd: futurePeriod,
       periodStart: currentPeriodStart,
       canceledAt: billingNowSeconds + 6,
+      endedAt: billingNowSeconds + 6,
       vendorId: vendor.id,
       created: billingNowSeconds + 6,
       type: "customer.subscription.deleted",
@@ -1311,6 +1373,10 @@ try {
   assert.equal(canceledStatus.subscription.cancelAtPeriodEnd, false);
   assert.equal(
     new Date(canceledStatus.subscription.canceledAt).getTime(),
+    (billingNowSeconds + 6) * 1000,
+  );
+  assert.equal(
+    new Date(canceledStatus.subscription.endedAt).getTime(),
     (billingNowSeconds + 6) * 1000,
   );
   assert.equal(canceledStatus.subscription.billingInterval, "month");
@@ -1334,7 +1400,8 @@ try {
   assert.equal(afterStale.subscription.isPremium, false);
   assert.equal(
     new Date(afterStale.subscription.subscriptionExpiresAt).getTime(),
-    futurePeriod * 1000,
+    (billingNowSeconds + 6) * 1000,
+    "ended_at is the authoritative end time once the subscription is canceled",
   );
   pass("Delayed older Stripe events cannot overwrite newer subscription state");
 
@@ -1938,6 +2005,7 @@ try {
       }),
       db.collection("favorites").deleteMany({ customerId: { $in: cleanupIds } }),
       db.collection("reviews").deleteMany({ customerId: { $in: cleanupIds } }),
+      db.collection("checkoutLocks").deleteMany({ _id: { $in: cleanupIds } }),
       db.collection("stripeEvents").deleteMany({ _id: { $in: webhookEventIds } }),
       db.collection("subscriptionEvents").deleteMany({
         stripeEventId: { $in: webhookEventIds },

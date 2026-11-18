@@ -53,7 +53,11 @@ export interface UserDoc {
   currentPeriodStart?: Date | null;
   currentPeriodEnd?: Date | null;
   subscriptionExpiresAt?: Date | null;
+  /** Stripe's cancel_at: when a scheduled cancellation takes effect. */
+  cancelAt?: Date | null;
   cancelAtPeriodEnd?: boolean;
+  /** Time Stripe reported that the subscription actually ended. */
+  endedAt?: Date | null;
   /** Time Stripe reported that the subscription was actually canceled. */
   canceledAt?: Date | null;
   /** Event timestamp/ID of the last accepted subscription state change. */
@@ -67,6 +71,17 @@ export interface UserDoc {
  * One record per verified Stripe webhook event. Used for idempotency and for
  * the admin's read-only billing history view.
  */
+/** Short-lived, atomic guard preventing concurrent checkout sessions per vendor. */
+export interface CheckoutLockDoc {
+  /** Vendor user id as a string. */
+  _id: string;
+  vendorId: string;
+  plan: BillingPlanId;
+  sessionId?: string | null;
+  createdAt: Date;
+  expiresAt: Date;
+}
+
 export interface StripeEventDoc {
   _id: string;
   type: string;

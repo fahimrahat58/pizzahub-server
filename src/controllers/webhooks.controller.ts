@@ -9,12 +9,14 @@ import {
   getEffectiveSubscription,
   recordSubscriptionEvent,
   recordTransaction,
+  releaseCheckoutLock,
   releaseStripeEvent,
   syncCheckoutSession,
   syncSubscription,
   type SubscriptionSyncInput,
 } from "../services/subscription.service.js";
 import { asyncHandler } from "../utils/errors.js";
+import { isValidObjectId } from "../utils/query.js";
 import type {
   BillingInterval,
   BillingPlanId,
@@ -49,8 +51,10 @@ const subscriptionInput = (
   customer: snapshot.customer,
   status: snapshot.status,
   metadata: snapshot.metadata,
+  cancel_at: snapshot.cancel_at,
   cancel_at_period_end: snapshot.cancel_at_period_end,
   canceled_at: snapshot.canceled_at,
+  ended_at: snapshot.ended_at,
   items: snapshot.items,
   ...options,
 });
@@ -81,6 +85,24 @@ const applyEvent = async (event: Stripe.Event): Promise<void> => {
   let paymentSubscriptionId: string | null = null;
 
   switch (event.type) {
+    case "checkout.session.expired": {
+      // An abandoned Checkout Session must not keep the duplicate-checkout
+      // guard engaged. No billing state is changed by this event.
+      const session = event.data.object;
+      const expiredVendorId =
+        session.metadata?.vendorId ?? session.client_reference_id ?? null;
+      if (expiredVendorId && isValidObjectId(expiredVendorId)) {
+        await releaseCheckoutLock(expiredVendorId, session.id);
+        console.info("Stripe checkout session expired; checkout guard released", {
+          eventId,
+          sessionId: session.id,
+          vendorId: expiredVendorId,
+          customerId: idOf(session.customer),
+        });
+      }
+      return;
+    }
+
     case "checkout.session.completed": {
       const session = event.data.object;
       description = "Checkout completed";
@@ -128,6 +150,16 @@ const applyEvent = async (event: Stripe.Event): Promise<void> => {
           status = eventStatus(effective.status);
         }
       }
+
+      console.info("Stripe checkout completion resolved", {
+        eventId,
+        sessionId: session.id,
+        customerId: idOf(session.customer),
+        subscriptionId: snapshot?.id ?? idOf(session.subscription),
+        vendorId,
+        billingInterval,
+      });
+      if (vendorId) await releaseCheckoutLock(vendorId, session.id);
       break;
     }
 
@@ -143,6 +175,7 @@ const applyEvent = async (event: Stripe.Event): Promise<void> => {
         const effective = getEffectiveSubscription(user);
         plan = effective.plan;
         status = eventStatus(effective.status);
+        await releaseCheckoutLock(vendorId);
       }
       break;
     }
@@ -163,6 +196,7 @@ const applyEvent = async (event: Stripe.Event): Promise<void> => {
         const effective = getEffectiveSubscription(user);
         plan = effective.plan;
         status = eventStatus(effective.status);
+        await releaseCheckoutLock(vendorId);
       }
       break;
     }
@@ -300,7 +334,7 @@ export const stripeWebhook = asyncHandler(async (req: Request, res: Response) =>
       eventId: event.id,
       eventType: event.type,
     });
-    res.json({ received: true });
+    res.json({ received: true, processed: true, eventId: event.id });
   } catch (error) {
     // Release the claim so Stripe's automatic retry can process the event.
     // A cleanup failure must not leave the client without a response.

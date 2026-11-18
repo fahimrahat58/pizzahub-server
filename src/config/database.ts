@@ -4,6 +4,7 @@ import { MongoClient, type Collection, type Db, type ObjectId } from "mongodb";
 
 import { env } from "./env.js";
 import type {
+  CheckoutLockDoc,
   FavoriteDoc,
   MenuItemDoc,
   OrderDoc,
@@ -57,6 +58,9 @@ export const collections = {
   favorites: (): Collection<FavoriteDoc> =>
     db.collection<FavoriteDoc>("favorites"),
   reviews: (): Collection<ReviewDoc> => db.collection<ReviewDoc>("reviews"),
+  // Short-lived checkout mutex keyed by vendor user id.
+  checkoutLocks: (): Collection<CheckoutLockDoc> =>
+    db.collection<CheckoutLockDoc>("checkoutLocks"),
   // Webhook idempotency ledger. `_id` is the Stripe event id.
   stripeEvents: (): Collection<StripeEventDoc> =>
     db.collection<StripeEventDoc>("stripeEvents"),

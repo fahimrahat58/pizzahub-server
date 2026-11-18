@@ -195,6 +195,15 @@ export const createIndexes = async (): Promise<void> => {
         ),
     },
     {
+      name: "checkoutLocks.expiresAt",
+      // MongoDB removes abandoned checkout guards automatically. The lock is
+      // never a subscription-state source of truth.
+      run: () =>
+        collections
+          .checkoutLocks()
+          .createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }),
+    },
+    {
       name: "subscriptionEvents.vendor",
       run: () =>
         collections
