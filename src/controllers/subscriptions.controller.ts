@@ -150,6 +150,7 @@ export const getSubscriptionStatus = asyncHandler(
   async (req: Request, res: Response) => {
     let user = await collections.users().findOne(vendorFilter(req.user!.id));
     if (!user) throw notFound("Vendor not found");
+    let stripeRecurringInterval: "month" | "year" | null = null;
 
     // Portal cancellations can happen moments before this request. Reconcile
     // from the authenticated vendor's own Stripe subscription so the UI does
@@ -165,6 +166,14 @@ export const getSubscriptionStatus = asyncHandler(
           typeof live.customer === "string" ? live.customer : live.customer.id;
 
         if (liveCustomerId === user.stripeCustomerId) {
+          const liveInterval = live.items.data
+            .map((item) => item.price?.recurring?.interval)
+            .find(
+              (interval): interval is "month" | "year" =>
+                interval === "month" || interval === "year",
+            );
+          stripeRecurringInterval = liveInterval ?? null;
+
           const synced = await syncSubscription(subscriptionSyncInput(live, true));
           if (synced) user = synced;
         } else {
@@ -183,6 +192,7 @@ export const getSubscriptionStatus = asyncHandler(
     }
 
     const effective = getEffectiveSubscription(user);
+    const purchasedInterval = stripeRecurringInterval ?? user.billingInterval ?? null;
 
     // Webhook confirmation can arrive while the success page is open; never
     // let an intermediary cache the result that page polls.
@@ -195,9 +205,15 @@ export const getSubscriptionStatus = asyncHandler(
         isPremium: effective.isPremium,
         activeItemLimit: effective.activeItemLimit,
         activeRestaurantLimit: effective.activeRestaurantLimit,
-        billingPlanId: user.billingPlanId ?? null,
+        billingPlanId:
+          purchasedInterval === "month"
+            ? "monthly"
+            : purchasedInterval === "year"
+              ? "yearly"
+              : user.billingPlanId ?? null,
         // The purchased cycle is Stripe-derived, never the frontend toggle.
-        billingInterval: user.billingInterval ?? null,
+        billingInterval: purchasedInterval,
+        stripeRecurringInterval,
         stripeCustomerId: user.stripeCustomerId ?? null,
         stripeSubscriptionId: user.stripeSubscriptionId ?? null,
         stripeCheckoutSessionId: user.stripeCheckoutSessionId ?? null,
