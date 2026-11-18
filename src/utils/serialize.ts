@@ -27,8 +27,11 @@ export const userDto = (user: UserDoc) => {
     // Legacy `pro` is normalised to `premium` for every API consumer.
     subscriptionPlan: effective.plan,
     subscriptionStatus: effective.status,
+    billingPlanId: user.billingPlanId ?? null,
     stripeCustomerId: user.stripeCustomerId ?? null,
     stripeSubscriptionId: user.stripeSubscriptionId ?? null,
+    stripeCheckoutSessionId: user.stripeCheckoutSessionId ?? null,
+    stripePriceId: user.stripePriceId ?? null,
     subscriptionExpiresAt: effective.expiresAt,
     cancelAtPeriodEnd: effective.cancelAtPeriodEnd,
     isPremium: effective.isPremium,

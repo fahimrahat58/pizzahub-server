@@ -169,20 +169,31 @@ const checkoutSessionIds = [];
 
 const subscriptionEvent = (
   eventId,
-  { customer, status, cancelAtPeriodEnd, periodEnd, vendorId, type = "customer.subscription.updated" },
+  {
+    customer,
+    status,
+    cancelAtPeriodEnd,
+    periodEnd,
+    vendorId,
+    plan = "monthly",
+    priceId = monthlyPriceId,
+    subscriptionId = `sub_it_${suffix}`,
+    created = Math.floor(Date.now() / 1000),
+    type = "customer.subscription.updated",
+  },
 ) => ({
   id: eventId,
   object: "event",
   api_version: "2025-03-31.basil",
   type,
-  created: Math.floor(Date.now() / 1000),
+  created,
   data: {
     object: {
-      id: `sub_it_${suffix}`,
+      id: subscriptionId,
       object: "subscription",
       customer,
       status,
-      metadata: { vendorId, plan: "monthly" },
+      metadata: { vendorId, plan },
       cancel_at_period_end: cancelAtPeriodEnd,
       items: {
         object: "list",
@@ -191,8 +202,36 @@ const subscriptionEvent = (
             id: `si_it_${suffix}`,
             object: "subscription_item",
             current_period_end: periodEnd,
+            price: { id: priceId },
           },
         ],
+      },
+    },
+  },
+});
+
+const invoiceEvent = (
+  eventId,
+  { customer, subscription, paid = true, amount = 1500, created = Math.floor(Date.now() / 1000) },
+) => ({
+  id: eventId,
+  object: "event",
+  api_version: "2025-03-31.basil",
+  type: paid ? "invoice.paid" : "invoice.payment_failed",
+  created,
+  data: {
+    object: {
+      id: `in_it_${eventId}`,
+      object: "invoice",
+      customer,
+      currency: "usd",
+      amount_paid: paid ? amount : 0,
+      amount_due: paid ? 0 : amount,
+      status: paid ? "paid" : "open",
+      parent: {
+        subscription_details: {
+          subscription,
+        },
       },
     },
   },
@@ -356,6 +395,126 @@ try {
   assert.equal(restaurant.restaurant.name, "Test Kitchen");
   pass("Vendor restaurant profile saved");
 
+  const restaurantPayload = (name) => ({
+    name,
+    description: `A temporary kitchen used for integration tests: ${name}`,
+    image: secondImageUrl,
+    address: `${100 + name.length} Test Avenue, Pizza City`,
+    phone: "+15559876543",
+    openingHours: "11:00-23:00",
+  });
+  const restaurantLimitMessage =
+    "You have reached the maximum limit of 3 restaurants. Upgrade to Premium to add more restaurants.";
+
+  // An untrusted vendorId in the body must never be accepted for ownership.
+  await api(
+    "otherVendor",
+    "POST",
+    "/api/restaurants/mine",
+    { ...restaurantPayload("Untrusted Kitchen"), vendorId: vendor.id },
+    400,
+  );
+
+  const ownedRestaurants = [];
+  for (let index = 1; index <= 3; index += 1) {
+    const data = await api(
+      "otherVendor",
+      "POST",
+      "/api/restaurants/mine",
+      restaurantPayload(`Limit Kitchen ${index}`),
+      201,
+    );
+    assert.equal(data.restaurant.vendorId, otherVendor.id);
+    ownedRestaurants.push(data.restaurant);
+  }
+  assert.equal(
+    await db.collection("restaurants").countDocuments({ vendorId: otherVendor.id }),
+    3,
+  );
+  const blockedRestaurant = await api(
+    "otherVendor",
+    "POST",
+    "/api/restaurants/mine",
+    restaurantPayload("Limit Kitchen 4"),
+    409,
+  );
+  assert.equal(blockedRestaurant.message, restaurantLimitMessage);
+
+  const editedAtLimit = await api(
+    "otherVendor",
+    "PUT",
+    `/api/restaurants/mine/${ownedRestaurants[2].id}`,
+    restaurantPayload("Limit Kitchen 3 Edited"),
+  );
+  assert.equal(editedAtLimit.restaurant.name, "Limit Kitchen 3 Edited");
+  pass("Free vendors are capped at three restaurants; edits at the cap still work");
+
+  await db.collection("users").updateOne(
+    { _id: new ObjectId(otherVendor.id) },
+    {
+      $set: {
+        subscriptionPlan: "premium",
+        subscriptionStatus: "active",
+        subscriptionExpiresAt: null,
+        cancelAtPeriodEnd: false,
+      },
+    },
+  );
+  const premiumRestaurant = await api(
+    "otherVendor",
+    "POST",
+    "/api/restaurants/mine",
+    restaurantPayload("Premium Kitchen 4"),
+    201,
+  );
+  assert.equal(premiumRestaurant.restaurant.vendorId, otherVendor.id);
+  await db.collection("users").updateOne(
+    { _id: new ObjectId(otherVendor.id) },
+    { $set: { subscriptionPlan: "free", subscriptionStatus: "canceled" } },
+  );
+  pass("Premium vendors can add restaurants beyond the Free plan cap");
+
+  // Leave this vendor empty for the ownership tests below.
+  for (const owned of [...ownedRestaurants, premiumRestaurant.restaurant]) {
+    await api("otherVendor", "DELETE", `/api/restaurants/mine/${owned.id}`);
+  }
+
+  // Two simultaneous creates from zero restaurants must still yield only one
+  // row: the unique free slot is the final authority after the count check.
+  const raceResults = await Promise.all(
+    ["Race Kitchen A", "Race Kitchen B"].map((name) =>
+      fetch(`${API}/api/restaurants/mine`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${tokens.get("otherVendor")}`,
+        },
+        body: JSON.stringify(restaurantPayload(name)),
+      }).then(async (response) => ({
+        status: response.status,
+        data: await json(response),
+      })),
+    ),
+  );
+  assert.deepEqual(
+    raceResults.map((result) => result.status).sort((a, b) => a - b),
+    [201, 409],
+  );
+  assert.equal(
+    raceResults.find((result) => result.status === 409)?.data.message,
+    restaurantLimitMessage,
+  );
+  assert.equal(
+    await db.collection("restaurants").countDocuments({ vendorId: otherVendor.id }),
+    1,
+  );
+  await api(
+    "otherVendor",
+    "DELETE",
+    `/api/restaurants/mine/${raceResults.find((result) => result.status === 201).data.restaurant.id}`,
+  );
+  pass("Concurrent duplicate creates cannot bypass the Free restaurant cap");
+
   const menuPayload = (name) => ({
     name,
     description: `A test pizza called ${name} with a full description`,
@@ -418,6 +577,17 @@ try {
   const locations = await api(null, "GET", "/api/menu/locations");
   assert.ok(locations.locations.includes("Downtown"));
   pass("Public menu filters by location and exposes the location list");
+
+  const categoryMenu = await api(
+    null,
+    "GET",
+    `/api/menu?category=${encodeURIComponent("  pizza  ")}&limit=100`,
+  );
+  assert.ok(categoryMenu.items.length >= 3);
+  assert.ok(categoryMenu.items.every((item) => item.category === "Pizza"));
+  const categoryOptions = await api(null, "GET", "/api/menu/categories");
+  assert.ok(categoryOptions.categories.includes("Pizza"));
+  pass("Public menu category filtering is case/spacing tolerant and exposes categories");
 
   const fourth = await api(
     "vendor",
@@ -762,7 +932,8 @@ try {
   assert.match(portal.url, /^https:\/\/billing\.stripe\.com\//);
   pass("Stripe billing portal session is created for the vendor");
 
-  const futurePeriod = Math.floor(Date.now() / 1000) + 30 * 24 * 60 * 60;
+  const billingNowSeconds = Math.floor(Date.now() / 1000);
+  const futurePeriod = billingNowSeconds + 30 * 24 * 60 * 60;
   const invalidEventId = `evt_it_invalid_${suffix}`;
   const invalidEvent = subscriptionEvent(invalidEventId, {
     customer: stripeCustomerId,
@@ -786,6 +957,7 @@ try {
       object: {
         id: checkout.sessionId,
         object: "checkout.session",
+        customer: stripeCustomerId,
         client_reference_id: vendor.id,
         metadata: { vendorId: vendor.id, plan: "monthly" },
         subscription: null,
@@ -821,6 +993,7 @@ try {
     cancelAtPeriodEnd: false,
     periodEnd: futurePeriod,
     vendorId: vendor.id,
+    created: billingNowSeconds,
     type: "customer.subscription.created",
   });
   const activation = await sendWebhook(activationEvent);
@@ -829,6 +1002,9 @@ try {
   assert.equal(premiumStatus.subscription.plan, "premium");
   assert.equal(premiumStatus.subscription.isPremium, true);
   assert.equal(premiumStatus.subscription.stripeSubscriptionId, activationEvent.data.object.id);
+  assert.equal(premiumStatus.subscription.stripeCheckoutSessionId, checkout.sessionId);
+  assert.equal(premiumStatus.subscription.billingPlanId, "monthly");
+  assert.equal(premiumStatus.subscription.stripePriceId, monthlyPriceId);
   assert.equal(
     new Date(premiumStatus.subscription.subscriptionExpiresAt).getTime(),
     futurePeriod * 1000,
@@ -841,6 +1017,56 @@ try {
   assert.equal(history.events.filter((entry) => entry.stripeEventId === activationEventId).length, 1);
   pass("Duplicate Stripe event deliveries are idempotent");
 
+  const wrongOwnerEventId = `evt_it_wrong_owner_${suffix}`;
+  webhookEventIds.push(wrongOwnerEventId);
+  const wrongOwner = await sendWebhook(
+    subscriptionEvent(wrongOwnerEventId, {
+      customer: stripeCustomerId,
+      status: "active",
+      cancelAtPeriodEnd: false,
+      periodEnd: futurePeriod + 60 * 60,
+      vendorId: otherVendor.id,
+      created: billingNowSeconds + 1,
+    }),
+  );
+  assert.equal(wrongOwner.response.status, 200, JSON.stringify(wrongOwner.data));
+  const afterWrongOwner = await api("vendor", "GET", "/api/subscriptions/status");
+  assert.equal(afterWrongOwner.subscription.stripeCustomerId, stripeCustomerId);
+  assert.equal(afterWrongOwner.subscription.stripeSubscriptionId, activationEvent.data.object.id);
+  assert.equal(
+    new Date(afterWrongOwner.subscription.subscriptionExpiresAt).getTime(),
+    futurePeriod * 1000,
+  );
+  pass("Webhook rejects Stripe metadata that conflicts with the stored vendor owner");
+
+  const paidInvoiceEventId = `evt_it_invoice_paid_${suffix}`;
+  webhookEventIds.push(paidInvoiceEventId);
+  const paidInvoice = await sendWebhook(
+    invoiceEvent(paidInvoiceEventId, {
+      customer: stripeCustomerId,
+      subscription: activationEvent.data.object,
+      paid: true,
+      amount: 2000,
+      created: billingNowSeconds + 2,
+    }),
+  );
+  assert.equal(paidInvoice.response.status, 200, JSON.stringify(paidInvoice.data));
+  const afterPaidInvoice = await api("vendor", "GET", "/api/subscriptions/status");
+  assert.equal(afterPaidInvoice.subscription.isPremium, true);
+  assert.equal(
+    new Date(afterPaidInvoice.subscription.subscriptionExpiresAt).getTime(),
+    futurePeriod * 1000,
+  );
+  const invoiceTransactions = await api("admin", "GET", "/api/admin/transactions");
+  const paidTransaction = invoiceTransactions.transactions.find(
+    (entry) => entry.stripeEventId === paidInvoiceEventId,
+  );
+  assert.ok(paidTransaction, "invoice.paid must create a read-only transaction record");
+  assert.equal(paidTransaction.amount, 20);
+  assert.equal(paidTransaction.status, "active");
+  assert.equal(paidTransaction.stripeSubscriptionId, activationEvent.data.object.id);
+  pass("Verified invoice.paid renews Premium and records the payment");
+
   const billingOverview = await api(
     "admin",
     "GET",
@@ -851,6 +1077,8 @@ try {
   assert.equal(billingRow.subscriptionPlan, "premium");
   assert.equal(billingRow.stripeCustomerId, stripeCustomerId);
   assert.equal(billingRow.stripeSubscriptionId, activationEvent.data.object.id);
+  assert.equal(billingRow.stripeCheckoutSessionId, checkout.sessionId);
+  assert.equal(billingRow.billingPlanId, "monthly");
   assert.ok(billingRow.subscriptionExpiresAt);
   pass("Admin sees read-only billing fields and webhook-derived history");
 
@@ -932,6 +1160,7 @@ try {
       cancelAtPeriodEnd: true,
       periodEnd: futurePeriod,
       vendorId: vendor.id,
+      created: billingNowSeconds + 3,
     }),
   );
   const cancelScheduled = await api("vendor", "GET", "/api/subscriptions/status");
@@ -968,12 +1197,44 @@ try {
       cancelAtPeriodEnd: false,
       periodEnd: futurePeriod,
       vendorId: vendor.id,
+      created: billingNowSeconds + 4,
     }),
   );
   const pastDue = await api("vendor", "GET", "/api/subscriptions/status");
   assert.equal(pastDue.subscription.status, "past_due");
   assert.equal(pastDue.subscription.plan, "free");
   pass("Failed renewal (past_due) removes Premium until Stripe restores it");
+
+  const failedInvoiceEventId = `evt_it_invoice_failed_${suffix}`;
+  webhookEventIds.push(failedInvoiceEventId);
+  const failedSubscription = subscriptionEvent(`evt_unused_${suffix}`, {
+    customer: stripeCustomerId,
+    status: "past_due",
+    cancelAtPeriodEnd: false,
+    periodEnd: futurePeriod,
+    vendorId: vendor.id,
+    created: billingNowSeconds + 5,
+  }).data.object;
+  const failedInvoice = await sendWebhook(
+    invoiceEvent(failedInvoiceEventId, {
+      customer: stripeCustomerId,
+      subscription: failedSubscription,
+      paid: false,
+      amount: 2500,
+      created: billingNowSeconds + 5,
+    }),
+  );
+  assert.equal(failedInvoice.response.status, 200, JSON.stringify(failedInvoice.data));
+  const failedInvoiceStatus = await api("vendor", "GET", "/api/subscriptions/status");
+  assert.equal(failedInvoiceStatus.subscription.status, "past_due");
+  const failedTransactions = await api("admin", "GET", "/api/admin/transactions");
+  const failedTransaction = failedTransactions.transactions.find(
+    (entry) => entry.stripeEventId === failedInvoiceEventId,
+  );
+  assert.ok(failedTransaction, "invoice.payment_failed must record a failed renewal");
+  assert.equal(failedTransaction.amount, 25);
+  assert.equal(failedTransaction.status, "past_due");
+  pass("Verified invoice.payment_failed records the failed renewal without restoring Premium");
 
   const deletedEventId = `evt_it_deleted_${suffix}`;
   webhookEventIds.push(deletedEventId);
@@ -984,6 +1245,7 @@ try {
       cancelAtPeriodEnd: false,
       periodEnd: futurePeriod,
       vendorId: vendor.id,
+      created: billingNowSeconds + 6,
       type: "customer.subscription.deleted",
     }),
   );
@@ -992,6 +1254,52 @@ try {
   assert.equal(canceledStatus.subscription.status, "canceled");
   assert.equal(canceledStatus.subscription.plan, "free");
   pass("Verified subscription.deleted webhook deactivates Premium");
+
+  const staleEventId = `evt_it_stale_${suffix}`;
+  webhookEventIds.push(staleEventId);
+  const stale = await sendWebhook(
+    subscriptionEvent(staleEventId, {
+      customer: stripeCustomerId,
+      status: "active",
+      cancelAtPeriodEnd: false,
+      periodEnd: futurePeriod + 24 * 60 * 60,
+      vendorId: vendor.id,
+      created: billingNowSeconds - 120,
+    }),
+  );
+  assert.equal(stale.response.status, 200, JSON.stringify(stale.data));
+  const afterStale = await api("vendor", "GET", "/api/subscriptions/status");
+  assert.equal(afterStale.subscription.status, "canceled");
+  assert.equal(afterStale.subscription.isPremium, false);
+  assert.equal(
+    new Date(afterStale.subscription.subscriptionExpiresAt).getTime(),
+    futurePeriod * 1000,
+  );
+  pass("Delayed older Stripe events cannot overwrite newer subscription state");
+
+  const resubscriptionEventId = `evt_it_resubscribe_${suffix}`;
+  webhookEventIds.push(resubscriptionEventId);
+  const resubscription = await sendWebhook(
+    subscriptionEvent(resubscriptionEventId, {
+      customer: stripeCustomerId,
+      status: "active",
+      cancelAtPeriodEnd: false,
+      periodEnd: futurePeriod + 30 * 24 * 60 * 60,
+      vendorId: vendor.id,
+      plan: "yearly",
+      priceId: yearlyPriceId,
+      subscriptionId: `sub_it_renew_${suffix}`,
+      created: billingNowSeconds + 7,
+      type: "customer.subscription.created",
+    }),
+  );
+  assert.equal(resubscription.response.status, 200, JSON.stringify(resubscription.data));
+  const resubscribed = await api("vendor", "GET", "/api/subscriptions/status");
+  assert.equal(resubscribed.subscription.isPremium, true);
+  assert.equal(resubscribed.subscription.stripeSubscriptionId, `sub_it_renew_${suffix}`);
+  assert.equal(resubscribed.subscription.billingPlanId, "yearly");
+  assert.equal(resubscribed.subscription.stripePriceId, yearlyPriceId);
+  pass("A new active subscription can replace a terminal canceled subscription");
 
   await api("customer", "POST", "/api/favorites", { menuItemId: itemIds[0] }, 201);
   const favoriteIds = await api("customer", "GET", "/api/favorites/ids");
@@ -1009,14 +1317,26 @@ try {
     deliveryDate,
     message: "Extra napkins please",
   };
+  const transactionsBeforeOrder = await api("admin", "GET", "/api/admin/transactions");
   const created = await api("customer", "POST", "/api/orders", orderPayload, 201);
   const order = created.order;
   assert.equal(order.status, "pending");
   assert.ok(created.email, "new order response must include email results");
   assert.equal(typeof created.email.vendor.sent, "boolean");
   assert.equal(typeof created.email.customer.sent, "boolean");
+  const paymentLikeKeys = Object.keys(order).filter((key) =>
+    /stripe|payment|checkout/i.test(key),
+  );
+  assert.deepEqual(paymentLikeKeys, [], "order DTO must not contain payment fields");
+  const transactionsAfterOrder = await api("admin", "GET", "/api/admin/transactions");
+  assert.equal(
+    transactionsAfterOrder.transactions.length,
+    transactionsBeforeOrder.transactions.length,
+    "placing a customer order must not create Stripe billing records",
+  );
   await api("customer", "POST", "/api/orders", orderPayload, 409);
   pass("Order creation stores the order, returns email status, and blocks duplicates");
+  pass("Customer pizza orders are Stripe-free and create no payment records");
 
   const vendorOrders = await api("vendor", "GET", "/api/orders/vendor?limit=100");
   assert.ok(vendorOrders.orders.some((entry) => entry.id === order.id));

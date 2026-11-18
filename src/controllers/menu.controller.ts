@@ -32,7 +32,9 @@ export const createMenuItemSchema = z.object({
   category: z.string().trim().min(2).max(40),
   price: z.number().positive().max(1000),
   ingredients: z.array(z.string().trim().min(1).max(60)).min(1).max(30),
-  location: z.string().trim().min(2, "Enter the area or city").max(100),
+  // Menu items no longer ask for a location; the owning restaurant's address
+  // remains the location source. Kept optional for older clients and data.
+  location: z.string().trim().max(100).optional(),
   image: imageUrl,
   images: z.array(imageUrl).max(6).optional(),
   isActive: z.boolean().optional(),
@@ -53,6 +55,13 @@ export const approvalSchema = z.object({
 
 const escapeRegex = (value: string): string =>
   value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/**
+ * Category filters ignore case and variable whitespace (including around "/")
+ * so the canonical homepage values match legacy/manually entered categories.
+ */
+const categoryMatcher = (value: string) =>
+  new RegExp(`^${escapeRegex(value.trim()).replace(/\s+/g, "\\s*")}$`, "i");
 
 /** Keeps the cover photo first and caps the gallery at six unique images. */
 const buildGallery = (cover: string, extra: string[] = []): string[] =>
@@ -147,7 +156,7 @@ export const listPublicMenu = asyncHandler(async (req: Request, res: Response) =
       { ingredients: expression },
     );
   }
-  if (category) filter.category = category;
+  if (category) filter.category = categoryMatcher(category);
   // New items store their own area / city. Legacy items inherit the
   // restaurant address, so both sources must participate in the filter.
   if (location) {
@@ -271,6 +280,7 @@ export const createMenuItem = asyncHandler(async (req: Request, res: Response) =
     vendorId: req.user!.id,
     restaurantId: restaurant._id,
     ...itemData,
+    location: data.location ?? "",
     images: buildGallery(data.image, data.images),
     approvalStatus: "pending",
     // Force hidden regardless of any client-supplied isActive value.

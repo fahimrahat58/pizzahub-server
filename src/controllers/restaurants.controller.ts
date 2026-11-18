@@ -1,8 +1,12 @@
 import type { Request, Response } from "express";
 import { z } from "zod";
-import { ObjectId } from "mongodb";
+import { MongoServerError, ObjectId } from "mongodb";
 
 import { collections } from "../config/database.js";
+import {
+  RESTAURANT_LIMIT_MESSAGE,
+  reserveFreeRestaurantSlot,
+} from "../services/restaurant.service.js";
 import { asyncHandler, badRequest, conflict, notFound } from "../utils/errors.js";
 import { isValidObjectId } from "../utils/query.js";
 import { restaurantDto } from "../utils/serialize.js";
@@ -102,16 +106,27 @@ const insertRestaurant = async (
   vendorId: string,
   data: z.infer<typeof restaurantSchemaBody>,
 ): Promise<RestaurantDoc> => {
+  const freeSlot = await reserveFreeRestaurantSlot(vendorId);
   const now = new Date();
   const restaurant: RestaurantDoc = {
     _id: new ObjectId(),
     vendorId,
     ...data,
     openingHours: data.openingHours ?? null,
+    ...(freeSlot === null ? {} : { freeSlot }),
     createdAt: now,
     updatedAt: now,
   };
-  await collections.restaurants().insertOne(restaurant);
+  try {
+    await collections.restaurants().insertOne(restaurant);
+  } catch (error) {
+    // A concurrent request may have claimed the same free slot between the
+    // count and the insert. The unique partial index is the final authority.
+    if (error instanceof MongoServerError && error.code === 11000) {
+      throw conflict(RESTAURANT_LIMIT_MESSAGE);
+    }
+    throw error;
+  }
   return restaurant;
 };
 

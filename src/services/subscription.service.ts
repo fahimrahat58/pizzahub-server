@@ -1,9 +1,10 @@
-import { MongoServerError, ObjectId } from "mongodb";
+import { MongoServerError, ObjectId, type Document } from "mongodb";
 import type Stripe from "stripe";
 
 import { collections } from "../config/database.js";
 import { isValidObjectId } from "../utils/query.js";
 import type {
+  BillingPlanId,
   StoredSubscriptionPlan,
   SubscriptionEventDoc,
   SubscriptionPlan,
@@ -15,7 +16,12 @@ import type {
 /** Free vendors may have at most three approved, active menu items. */
 export const FREE_ITEM_LIMIT = 3;
 
+/** Free vendors may own at most three restaurants. */
+export const FREE_RESTAURANT_LIMIT = 3;
+
 const ACTIVE_STATUSES: SubscriptionStatus[] = ["active", "trialing"];
+/** Statuses after which Stripe will not resume the same subscription. */
+const TERMINAL_STATUSES: SubscriptionStatus[] = ["canceled", "incomplete_expired"];
 const KNOWN_STATUSES: SubscriptionStatus[] = [
   "active",
   "trialing",
@@ -31,6 +37,10 @@ export const isActiveSubscriptionStatus = (
   status?: SubscriptionStatus | null,
 ): boolean => !!status && ACTIVE_STATUSES.includes(status);
 
+const isTerminalSubscriptionStatus = (
+  status?: SubscriptionStatus | null,
+): boolean => !!status && TERMINAL_STATUSES.includes(status);
+
 /** Legacy `pro` documents are treated as Premium everywhere. */
 export const normalizePlan = (
   plan?: StoredSubscriptionPlan | null,
@@ -44,6 +54,8 @@ export interface EffectiveSubscription {
   cancelAtPeriodEnd: boolean;
   /** null means unlimited. */
   activeItemLimit: number | null;
+  /** null means unlimited. */
+  activeRestaurantLimit: number | null;
 }
 
 type SubscriptionState = Pick<
@@ -79,6 +91,7 @@ export const getEffectiveSubscription = (
     expiresAt,
     cancelAtPeriodEnd: isPremium && (user.cancelAtPeriodEnd ?? false),
     activeItemLimit: isPremium ? null : FREE_ITEM_LIMIT,
+    activeRestaurantLimit: isPremium ? null : FREE_RESTAURANT_LIMIT,
   };
 };
 
@@ -97,6 +110,23 @@ type StripeSubscriptionState = Pick<
   "id" | "customer" | "status" | "metadata" | "cancel_at_period_end" | "items"
 >;
 
+export type SubscriptionSyncInput = StripeSubscriptionState & {
+  eventId?: string;
+  eventCreated?: number;
+  checkoutSessionId?: string | null;
+  /** Invoice events do not carry this flag, so keep the stored value. */
+  preserveCancelAtPeriodEnd?: boolean;
+};
+
+export type CheckoutSessionSyncInput = {
+  eventId: string;
+  eventCreated: number;
+  sessionId: string;
+  customerId?: string | null;
+  vendorId?: string | null;
+  plan?: BillingPlanId | null;
+};
+
 /**
  * Stripe API 2025-03-31 moved period boundaries onto subscription items.
  * Use the latest item period end as the renewal/expiration timestamp.
@@ -111,44 +141,74 @@ const periodEndOf = (subscription: StripeSubscriptionState): number => {
 const customerIdOf = (customer: string | { id: string } | Stripe.DeletedCustomer): string =>
   typeof customer === "string" ? customer : customer.id;
 
+const BILLING_PLAN_IDS: BillingPlanId[] = ["monthly", "yearly"];
+
+/** Only accept billing plan IDs PizzaHub itself writes into Stripe metadata. */
+const billingPlanIdOf = (metadata?: Stripe.Metadata | null): BillingPlanId | null => {
+  const plan = metadata?.plan;
+  return BILLING_PLAN_IDS.find((value) => value === plan) ?? null;
+};
+
+const priceIdOf = (subscription: StripeSubscriptionState): string | null => {
+  for (const item of subscription.items?.data ?? []) {
+    if (item.price?.id) return item.price.id;
+  }
+  return null;
+};
+
 /**
- * Resolves the vendor from data PizzaHub itself wrote to Stripe metadata, then
- * falls back to the stored customer/subscription ids. Email is never trusted.
+ * Resolves the vendor from the stored Stripe customer/subscription mapping
+ * first. Metadata is a PizzaHub-written hint only: a conflicting metadata
+ * vendor is rejected instead of reassigning another vendor's subscription.
+ * Email is never trusted.
  */
 const resolveVendor = async (
   subscription: StripeSubscriptionState,
   customerId: string,
 ): Promise<UserDoc | null> => {
   const metadataVendorId = subscription.metadata?.vendorId;
+  const [byCustomer, bySubscription, byMetadata] = await Promise.all([
+    collections.users().findOne({ stripeCustomerId: customerId, role: "vendor" }),
+    collections.users().findOne({ stripeSubscriptionId: subscription.id, role: "vendor" }),
+    metadataVendorId && isValidObjectId(metadataVendorId)
+      ? collections.users().findOne({
+          _id: new ObjectId(metadataVendorId),
+          role: "vendor",
+        })
+      : Promise.resolve(null),
+  ]);
 
-  if (metadataVendorId && isValidObjectId(metadataVendorId)) {
-    const byMetadata = await collections.users().findOne({
-      _id: new ObjectId(metadataVendorId),
-      role: "vendor",
+  const candidates = [byCustomer, bySubscription, byMetadata].filter(
+    (value): value is UserDoc => value !== null,
+  );
+  const distinctOwners = new Set(candidates.map((value) => value._id.toHexString()));
+  if (distinctOwners.size > 1) {
+    console.warn("Stripe subscription ignored: conflicting ownership metadata", {
+      subscriptionId: subscription.id,
+      customerId,
     });
-    if (byMetadata) return byMetadata;
+    return null;
   }
 
-  const byCustomer = await collections.users().findOne({
-    stripeCustomerId: customerId,
-    role: "vendor",
-  });
-  if (byCustomer) return byCustomer;
-
-  const bySubscription = await collections.users().findOne({
-    stripeSubscriptionId: subscription.id,
-    role: "vendor",
-  });
-  return bySubscription ?? null;
+  return byCustomer ?? bySubscription ?? byMetadata ?? null;
 };
 
 /**
  * Applies a Stripe subscription snapshot to MongoDB. Only called from the
- * verified webhook handler.
+ * verified webhook handler. The update is conditional on the prior Stripe
+ * identity and event age, so delayed events and concurrent writes cannot roll
+ * Premium back to an older state.
  */
 export const syncSubscription = async (
-  subscription: StripeSubscriptionState,
+  input: SubscriptionSyncInput,
 ): Promise<UserDoc | null> => {
+  const {
+    eventId,
+    eventCreated,
+    checkoutSessionId,
+    preserveCancelAtPeriodEnd,
+    ...subscription
+  } = input;
   const customerId = customerIdOf(subscription.customer);
   const vendor = await resolveVendor(subscription, customerId);
 
@@ -160,10 +220,18 @@ export const syncSubscription = async (
     return null;
   }
 
-  // Prevent a customer/sub id from being reassigned to a different vendor.
+  const status = normalizeStripeStatus(subscription.status);
+  const incomingActive = isActiveSubscriptionStatus(status);
+  const replacingSubscription =
+    Boolean(vendor.stripeSubscriptionId) && vendor.stripeSubscriptionId !== subscription.id;
+  const canReplaceTerminal =
+    isTerminalSubscriptionStatus(vendor.subscriptionStatus) && incomingActive;
+
+  // A stored customer can never be reassigned. A different subscription may
+  // replace a terminal one only when the incoming subscription is active.
   if (
     (vendor.stripeCustomerId && vendor.stripeCustomerId !== customerId) ||
-    (vendor.stripeSubscriptionId && vendor.stripeSubscriptionId !== subscription.id)
+    (replacingSubscription && !canReplaceTerminal)
   ) {
     console.warn("Stripe subscription ignored: identity mismatch", {
       subscriptionId: subscription.id,
@@ -172,27 +240,179 @@ export const syncSubscription = async (
     return null;
   }
 
-  const status = normalizeStripeStatus(subscription.status);
-  const plan: SubscriptionPlan = isActiveSubscriptionStatus(status)
-    ? "premium"
-    : "free";
+  const plan: SubscriptionPlan = incomingActive ? "premium" : "free";
   const periodEnd = periodEndOf(subscription);
+  const eventSeconds =
+    typeof eventCreated === "number" && Number.isFinite(eventCreated)
+      ? eventCreated
+      : Math.floor(Date.now() / 1000);
+  const eventAt = new Date(eventSeconds * 1000);
+
+  // Build an atomic guard from the vendor snapshot we just validated. Every
+  // condition must still hold when MongoDB applies the update.
+  const filter: Document = { _id: vendor._id, role: "vendor" };
+  const conditions: Document[] = [];
+
+  if (vendor.stripeSubscriptionId) {
+    filter.stripeSubscriptionId = vendor.stripeSubscriptionId;
+  } else {
+    conditions.push({
+      $or: [
+        { stripeSubscriptionId: { $exists: false } },
+        { stripeSubscriptionId: null },
+      ],
+    });
+  }
+
+  conditions.push({
+    $or: [
+      { subscriptionEventCreatedAt: { $exists: false } },
+      { subscriptionEventCreatedAt: null },
+      { subscriptionEventCreatedAt: { $lte: eventAt } },
+    ],
+  });
+
+  // A renewal cannot move the period end backwards for the same subscription.
+  // A brand-new subscription replacing a canceled one is allowed to differ.
+  if (!replacingSubscription && periodEnd > 0) {
+    conditions.push({
+      $or: [
+        { subscriptionExpiresAt: { $exists: false } },
+        { subscriptionExpiresAt: null },
+        { subscriptionExpiresAt: { $lte: new Date(periodEnd * 1000) } },
+      ],
+    });
+  }
+
+  if (conditions.length > 0) filter.$and = conditions;
 
   const updated = await collections.users().findOneAndUpdate(
-    { _id: vendor._id, role: "vendor" },
+    filter,
     {
       $set: {
         subscriptionPlan: plan,
         subscriptionStatus: status,
+        billingPlanId: billingPlanIdOf(subscription.metadata) ?? vendor.billingPlanId ?? null,
+        stripePriceId: priceIdOf(subscription) ?? vendor.stripePriceId ?? null,
         stripeCustomerId: customerId,
         stripeSubscriptionId: subscription.id,
+        stripeCheckoutSessionId: checkoutSessionId ?? vendor.stripeCheckoutSessionId ?? null,
         subscriptionExpiresAt: periodEnd > 0 ? new Date(periodEnd * 1000) : null,
-        cancelAtPeriodEnd: subscription.cancel_at_period_end === true,
+        cancelAtPeriodEnd: preserveCancelAtPeriodEnd
+          ? vendor.cancelAtPeriodEnd ?? false
+          : subscription.cancel_at_period_end === true,
+        subscriptionEventCreatedAt: eventAt,
+        subscriptionEventId: eventId ?? null,
         updatedAt: new Date(),
       },
     },
     { returnDocument: "after" },
   );
+
+  if (!updated) {
+    console.warn("Stripe subscription event was stale or superseded", {
+      eventId: eventId ?? null,
+      subscriptionId: subscription.id,
+      vendorId: vendor._id.toHexString(),
+    });
+  }
+
+  return updated ?? null;
+};
+
+/**
+ * Links a verified Checkout Session to the vendor without changing plan state.
+ * Plan activation still requires a subscription lifecycle webhook.
+ */
+export const syncCheckoutSession = async (
+  input: CheckoutSessionSyncInput,
+): Promise<UserDoc | null> => {
+  const metadataVendorId = input.vendorId;
+  const [byCustomer, byMetadata] = await Promise.all([
+    input.customerId
+      ? collections.users().findOne({ stripeCustomerId: input.customerId, role: "vendor" })
+      : Promise.resolve(null),
+    metadataVendorId && isValidObjectId(metadataVendorId)
+      ? collections.users().findOne({
+          _id: new ObjectId(metadataVendorId),
+          role: "vendor",
+        })
+      : Promise.resolve(null),
+  ]);
+
+  const candidates = [byCustomer, byMetadata].filter(
+    (value): value is UserDoc => value !== null,
+  );
+  const distinctOwners = new Set(candidates.map((value) => value._id.toHexString()));
+  if (distinctOwners.size > 1) {
+    console.warn("Stripe checkout ignored: conflicting ownership metadata", {
+      sessionId: input.sessionId,
+      customerId: input.customerId ?? null,
+    });
+    return null;
+  }
+
+  const vendor = byCustomer ?? byMetadata ?? null;
+  if (!vendor) {
+    console.warn("Stripe checkout ignored: no matching vendor", {
+      sessionId: input.sessionId,
+      customerId: input.customerId ?? null,
+    });
+    return null;
+  }
+
+  if (
+    vendor.stripeCustomerId &&
+    input.customerId &&
+    vendor.stripeCustomerId !== input.customerId
+  ) {
+    console.warn("Stripe checkout ignored: customer identity mismatch", {
+      sessionId: input.sessionId,
+      vendorId: vendor._id.toHexString(),
+    });
+    return null;
+  }
+
+  const eventSeconds =
+    typeof input.eventCreated === "number" && Number.isFinite(input.eventCreated)
+      ? input.eventCreated
+      : Math.floor(Date.now() / 1000);
+  const eventAt = new Date(eventSeconds * 1000);
+  const filter: Document = { _id: vendor._id, role: "vendor" };
+  if (input.customerId) filter.stripeCustomerId = input.customerId;
+  filter.$and = [
+    {
+      $or: [
+        { stripeCheckoutSessionId: { $exists: false } },
+        { stripeCheckoutSessionId: null },
+        { stripeCheckoutSessionId: input.sessionId },
+        { checkoutEventCreatedAt: { $exists: false } },
+        { checkoutEventCreatedAt: null },
+        { checkoutEventCreatedAt: { $lte: eventAt } },
+      ],
+    },
+  ];
+
+  const updated = await collections.users().findOneAndUpdate(
+    filter,
+    {
+      $set: {
+        stripeCheckoutSessionId: input.sessionId,
+        checkoutEventCreatedAt: eventAt,
+        billingPlanId: input.plan ?? vendor.billingPlanId ?? null,
+        updatedAt: new Date(),
+      },
+    },
+    { returnDocument: "after" },
+  );
+
+  if (!updated) {
+    console.warn("Stripe checkout event was stale or superseded", {
+      eventId: input.eventId,
+      sessionId: input.sessionId,
+      vendorId: vendor._id.toHexString(),
+    });
+  }
 
   return updated ?? null;
 };

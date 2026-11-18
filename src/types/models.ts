@@ -7,6 +7,9 @@ export type SubscriptionPlan = "free" | "premium";
 export type LegacySubscriptionPlan = "pro";
 export type StoredSubscriptionPlan = SubscriptionPlan | LegacySubscriptionPlan;
 
+/** Billing intervals written by PizzaHub into Stripe metadata. */
+export type BillingPlanId = "monthly" | "yearly";
+
 /** Mirrors Stripe's subscription statuses that PizzaHub cares about. */
 export type SubscriptionStatus =
   | "active"
@@ -32,10 +35,20 @@ export interface UserDoc {
   address?: string | null;
   subscriptionPlan?: StoredSubscriptionPlan;
   subscriptionStatus?: SubscriptionStatus | null;
+  /** Billing interval from verified Stripe subscription metadata. */
+  billingPlanId?: BillingPlanId | null;
+  /** Stripe Price ID from the verified subscription snapshot. */
+  stripePriceId?: string | null;
   stripeCustomerId?: string | null;
   stripeSubscriptionId?: string | null;
+  stripeCheckoutSessionId?: string | null;
+  /** Event timestamp of the last accepted checkout/session linkage. */
+  checkoutEventCreatedAt?: Date | null;
   subscriptionExpiresAt?: Date | null;
   cancelAtPeriodEnd?: boolean;
+  /** Event timestamp/ID of the last accepted subscription state change. */
+  subscriptionEventCreatedAt?: Date | null;
+  subscriptionEventId?: string | null;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -116,6 +129,8 @@ export interface RestaurantDoc {
   address: string;
   phone: string;
   openingHours?: string | null;
+  /** Internal, unique-per-vendor slot used to cap Free plan restaurants. */
+  freeSlot?: number;
   createdAt: Date;
   updatedAt: Date;
 }

@@ -82,6 +82,20 @@ export const createIndexes = async (): Promise<void> => {
       run: ensureRestaurantVendorIndex,
     },
     {
+      name: "restaurants.freeSlot",
+      // Partial index: Premium restaurants and legacy rows without a slot are
+      // left alone, while concurrent Free-plan inserts cannot claim the same slot.
+      run: () =>
+        collections.restaurants().createIndex(
+          { vendorId: 1, freeSlot: 1 },
+          {
+            name: "restaurants_free_slot_uidx",
+            unique: true,
+            partialFilterExpression: { freeSlot: { $exists: true } },
+          },
+        ),
+    },
+    {
       name: "orders.customer",
       run: () =>
         collections.orders().createIndex({ customerId: 1, createdAt: -1 }),
@@ -160,6 +174,18 @@ export const createIndexes = async (): Promise<void> => {
             name: "users_stripe_subscription_uidx",
             unique: true,
             partialFilterExpression: { stripeSubscriptionId: { $type: "string" } },
+          },
+        ),
+    },
+    {
+      name: "users.stripeCheckoutSession",
+      run: () =>
+        collections.users().createIndex(
+          { stripeCheckoutSessionId: 1 },
+          {
+            name: "users_stripe_checkout_session_uidx",
+            unique: true,
+            partialFilterExpression: { stripeCheckoutSessionId: { $type: "string" } },
           },
         ),
     },
