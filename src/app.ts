@@ -1,6 +1,7 @@
 import cors from "cors";
 import express from "express";
 
+import { initializeRuntime } from "./config/bootstrap.js";
 import { env } from "./config/env.js";
 import { errorHandler } from "./utils/errors.js";
 
@@ -18,6 +19,17 @@ import subscriptionRoutes from "./routes/subscriptions.routes.js";
 import webhookRoutes from "./routes/webhooks.routes.js";
 
 const app = express();
+
+// Every request waits for the shared MongoDB/index/migration initialization.
+// This is a no-op after the first successful invocation.
+app.use(async (_req, _res, next) => {
+  try {
+    await initializeRuntime();
+    next();
+  } catch (error) {
+    next(error);
+  }
+});
 
 app.use(
   cors({

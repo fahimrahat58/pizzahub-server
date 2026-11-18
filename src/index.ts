@@ -1,95 +1,36 @@
 import "dotenv/config";
 
-import type { IncomingMessage, ServerResponse } from "node:http";
+import { pathToFileURL } from "node:url";
 
 import app from "./app.js";
-import { connectDB } from "./config/database.js";
-import { createIndexes } from "./config/indexes.js";
-import { migrateMenuPublishing } from "./config/migrations.js";
+import { initializeRuntime } from "./config/bootstrap.js";
 import { env } from "./config/env.js";
 
 /**
- * Serverless functions reuse the same module instance, so initialization is
- * cached. A failed attempt is cleared so the next invocation can retry.
+ * Vercel's Express detection expects `src/index.ts` to default-export the
+ * Express application itself. Do not start a listener in this module when it
+ * is imported by the serverless runtime.
  */
-let initialization: Promise<void> | undefined;
+export default app;
 
-const initialize = (): Promise<void> => {
-  if (!initialization) {
-    initialization = (async () => {
-      await connectDB();
-      await createIndexes();
-      await migrateMenuPublishing();
-    })().catch((error: unknown) => {
-      initialization = undefined;
-      throw error;
+const isDirectRun =
+  process.argv[1] !== undefined &&
+  import.meta.url === pathToFileURL(process.argv[1]).href;
+
+const isVercel = Boolean(
+  process.env.VERCEL ?? process.env.VERCEL_ENV ?? process.env.VERCEL_REGION,
+);
+
+/** Local `npm run dev` / `npm start` still starts a normal HTTP server. */
+if (isDirectRun && !isVercel) {
+  void initializeRuntime()
+    .then(() => {
+      app.listen(env.port, () => {
+        console.log(`PizzaHub server running on port ${env.port}`);
+      });
+    })
+    .catch((error: unknown) => {
+      console.error("Server startup failed:", error);
+      process.exit(1);
     });
-  }
-  return initialization;
-};
-
-const handleRequest = (
-  req: IncomingMessage,
-  res: ServerResponse,
-): Promise<void> =>
-  new Promise<void>((resolve, reject) => {
-    const cleanup = (): void => {
-      res.off("finish", onFinish);
-      res.off("close", onClose);
-      res.off("error", onError);
-    };
-
-    const onFinish = (): void => {
-      cleanup();
-      resolve();
-    };
-
-    const onClose = (): void => {
-      cleanup();
-      resolve();
-    };
-
-    const onError = (error: Error): void => {
-      cleanup();
-      reject(error);
-    };
-
-    res.once("finish", onFinish);
-    res.once("close", onClose);
-    res.once("error", onError);
-
-    try {
-      app(req, res);
-    } catch (error) {
-      cleanup();
-      reject(error);
-    }
-  });
-
-/** Vercel invokes this exported function instead of starting an HTTP listener. */
-export const handler = async (
-  req: IncomingMessage,
-  res: ServerResponse,
-): Promise<void> => {
-  await initialize();
-  await handleRequest(req, res);
-};
-
-export default handler;
-
-/** Local development still uses `app.listen()`. */
-const startServer = async (): Promise<void> => {
-  try {
-    await initialize();
-    app.listen(env.port, () => {
-      console.log(`PizzaHub server running on port ${env.port}`);
-    });
-  } catch (error) {
-    console.error("Server startup failed:", error);
-    process.exit(1);
-  }
-};
-
-if (process.env.VERCEL !== "1") {
-  void startServer();
 }
