@@ -8,11 +8,9 @@ const uploadWindow = new Map<string, number[]>();
 const WINDOW_MS = 10 * 60 * 1000;
 const MAX_PER_WINDOW = 12;
 
-const clientIp = (req: Request): string => {
-  const forwarded = req.headers["x-forwarded-for"];
-  if (typeof forwarded === "string") return forwarded.split(",")[0]!.trim();
-  return req.ip ?? "unknown";
-};
+// Do not trust `x-forwarded-for` unless the deployment explicitly configures
+// Express `trust proxy`. The socket address is the only unspoofable value here.
+const clientIp = (req: Request): string => req.ip ?? "unknown";
 
 const throttle = (req: Request): void => {
   const key = clientIp(req);

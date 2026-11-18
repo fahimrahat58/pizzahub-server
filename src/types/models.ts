@@ -191,7 +191,10 @@ export interface FavoriteDoc {
 export interface ReviewDoc {
   _id: ObjectId;
   customerId: string;
-  menuItemId: ObjectId;
+  /** Present for pizza reviews; absent for restaurant-only reviews. */
+  menuItemId?: ObjectId;
+  /** Present for restaurant reviews; absent for pizza-only reviews. */
+  restaurantId?: ObjectId;
   orderId: ObjectId;
   rating: number;
   comment: string;

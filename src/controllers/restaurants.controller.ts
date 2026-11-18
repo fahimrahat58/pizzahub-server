@@ -19,13 +19,50 @@ export const restaurantSchemaBody = z
   })
   .strict();
 
+type RestaurantRating = { ratingAvg: number; reviewCount: number };
+
+const ratingsForRestaurants = async (
+  restaurants: RestaurantDoc[],
+): Promise<Map<string, RestaurantRating>> => {
+  const ratings = new Map<string, RestaurantRating>();
+  if (restaurants.length === 0) return ratings;
+
+  const rows = await collections
+    .reviews()
+    .aggregate<{ _id: ObjectId; ratingAvg: number; reviewCount: number }>([
+      { $match: { restaurantId: { $in: restaurants.map((item) => item._id) } } },
+      {
+        $group: {
+          _id: "$restaurantId",
+          ratingAvg: { $avg: "$rating" },
+          reviewCount: { $sum: 1 },
+        },
+      },
+    ])
+    .toArray();
+
+  for (const row of rows) {
+    ratings.set(row._id.toHexString(), {
+      ratingAvg: Math.round(row.ratingAvg * 10) / 10,
+      reviewCount: row.reviewCount,
+    });
+  }
+  return ratings;
+};
+
 export const listRestaurants = asyncHandler(async (_req: Request, res: Response) => {
   const restaurants = await collections
     .restaurants()
     .find({})
     .sort({ createdAt: -1 })
     .toArray();
-  res.json({ success: true, restaurants: restaurants.map(restaurantDto) });
+  const ratings = await ratingsForRestaurants(restaurants);
+  res.json({
+    success: true,
+    restaurants: restaurants.map((restaurant) =>
+      restaurantDto(restaurant, ratings.get(restaurant._id.toHexString())),
+    ),
+  });
 });
 
 export const getRestaurant = asyncHandler(async (req: Request, res: Response) => {
@@ -34,7 +71,11 @@ export const getRestaurant = asyncHandler(async (req: Request, res: Response) =>
     .restaurants()
     .findOne({ _id: new ObjectId(String(req.params.id)) });
   if (!restaurant) throw notFound("Restaurant not found");
-  res.json({ success: true, restaurant: restaurantDto(restaurant) });
+  const ratings = await ratingsForRestaurants([restaurant]);
+  res.json({
+    success: true,
+    restaurant: restaurantDto(restaurant, ratings.get(restaurant._id.toHexString())),
+  });
 });
 
 export const listMyRestaurants = asyncHandler(
@@ -44,11 +85,15 @@ export const listMyRestaurants = asyncHandler(
       .find({ vendorId: req.user!.id })
       .sort({ createdAt: 1 })
       .toArray();
+    const ratings = await ratingsForRestaurants(restaurants);
+    const withRatings = restaurants.map((restaurant) =>
+      restaurantDto(restaurant, ratings.get(restaurant._id.toHexString())),
+    );
     res.json({
       success: true,
-      restaurants: restaurants.map(restaurantDto),
+      restaurants: withRatings,
       // Backwards-compatible field for older dashboard widgets.
-      restaurant: restaurants.length > 0 ? restaurantDto(restaurants[0]) : null,
+      restaurant: withRatings[0] ?? null,
     });
   },
 );

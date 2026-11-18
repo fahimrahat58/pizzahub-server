@@ -111,7 +111,10 @@ export const menuItemDto = (
   };
 };
 
-export const restaurantDto = (restaurant: RestaurantDoc) => ({
+export const restaurantDto = (
+  restaurant: RestaurantDoc,
+  rating?: { ratingAvg: number; reviewCount: number },
+) => ({
   id: id(restaurant),
   vendorId: restaurant.vendorId,
   name: restaurant.name,
@@ -120,6 +123,8 @@ export const restaurantDto = (restaurant: RestaurantDoc) => ({
   address: restaurant.address,
   phone: restaurant.phone,
   openingHours: restaurant.openingHours ?? null,
+  ratingAvg: rating?.ratingAvg ?? 0,
+  reviewCount: rating?.reviewCount ?? 0,
   createdAt: restaurant.createdAt,
   updatedAt: restaurant.updatedAt,
 });
@@ -160,7 +165,8 @@ export const favoriteDto = (favorite: FavoriteDoc) => ({
 export const reviewDto = (review: ReviewDoc) => ({
   id: id(review),
   customerId: review.customerId,
-  menuItemId: review.menuItemId.toHexString(),
+  menuItemId: review.menuItemId?.toHexString() ?? null,
+  restaurantId: review.restaurantId?.toHexString() ?? null,
   orderId: review.orderId.toHexString(),
   rating: review.rating,
   comment: review.comment,

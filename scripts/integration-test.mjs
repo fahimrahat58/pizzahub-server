@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import "dotenv/config";
+import { symmetricDecrypt } from "better-auth/crypto";
+import { SignJWT, decodeJwt, decodeProtectedHeader, importJWK } from "jose";
 import { MongoClient, ObjectId } from "mongodb";
 import Stripe from "stripe";
 
@@ -147,6 +149,13 @@ const api = async (actor, method, path, body, expected = 200) => {
   return data;
 };
 
+const rawProtected = async (token, path = "/api/test/protected") => {
+  const response = await fetch(`${API}${path}`, {
+    headers: token ? { authorization: `Bearer ${token}` } : {},
+  });
+  return { status: response.status, data: await json(response) };
+};
+
 const pass = (message) => console.log(`PASS  ${message}`);
 
 assert.match(monthlyPriceId, /^price_/, "STRIPE_PRICE_ID_MONTHLY must be a price_... ID");
@@ -262,6 +271,75 @@ try {
   }
   pass("JWT tokens issued and accepted by the Express API");
 
+  const validToken = tokens.get("customer");
+  assert.equal((await rawProtected(null)).status, 401);
+  assert.equal((await rawProtected("not-a-jwt")).status, 401);
+  pass("Protected routes reject missing and malformed bearer tokens");
+
+  const tokenParts = validToken.split(".");
+  const originalClaims = JSON.parse(
+    Buffer.from(tokenParts[1], "base64url").toString("utf8"),
+  );
+  const tamperedClaims = Buffer.from(
+    JSON.stringify({ ...originalClaims, sub: new ObjectId().toHexString() }),
+  ).toString("base64url");
+  const tamperedToken = `${tokenParts[0]}.${tamperedClaims}.${tokenParts[2]}`;
+  assert.equal((await rawProtected(tamperedToken)).status, 401);
+
+  const tokenHeader = decodeProtectedHeader(validToken);
+  const tokenClaims = decodeJwt(validToken);
+  assert.ok(tokenHeader.alg && tokenHeader.kid, "issued JWT must carry alg and kid");
+  const jwkDoc = await db.collection("jwks").findOne({
+    $or: [
+      { id: tokenHeader.kid },
+      { _id: tokenHeader.kid },
+      { _id: new ObjectId(tokenHeader.kid) },
+    ],
+  });
+  assert.ok(jwkDoc?.privateKey, "JWKS signing key was not persisted");
+  const privateWebKey = await symmetricDecrypt({
+    key: process.env.BETTER_AUTH_SECRET,
+    data: JSON.parse(jwkDoc.privateKey),
+  });
+  const signingKey = await importJWK(JSON.parse(privateWebKey), tokenHeader.alg);
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  const expiredToken = await new SignJWT({ sessionId: tokenClaims.sessionId })
+    .setProtectedHeader({ alg: tokenHeader.alg, kid: tokenHeader.kid })
+    .setSubject(String(tokenClaims.sub))
+    .setIssuer(String(tokenClaims.iss))
+    .setAudience(String(tokenClaims.aud))
+    .setIssuedAt(nowSeconds - 3600)
+    .setExpirationTime(nowSeconds - 60)
+    .sign(signingKey);
+  assert.equal((await rawProtected(expiredToken)).status, 401);
+
+  const wrongIssuerToken = await new SignJWT({ sessionId: tokenClaims.sessionId })
+    .setProtectedHeader({ alg: tokenHeader.alg, kid: tokenHeader.kid })
+    .setSubject(String(tokenClaims.sub))
+    .setIssuer(`${AUTH}-wrong`)
+    .setAudience(String(tokenClaims.aud))
+    .setIssuedAt(nowSeconds)
+    .setExpirationTime(nowSeconds + 300)
+    .sign(signingKey);
+  assert.equal((await rawProtected(wrongIssuerToken)).status, 401);
+  pass("Tampered, expired, and wrong-issuer JWTs are rejected");
+
+  const sessionId = String(tokenClaims.sessionId ?? "");
+  assert.match(sessionId, /^[a-fA-F0-9]{24}$/, "JWT must carry the Better Auth session id");
+  const sessionDoc = await db.collection("session").findOne({
+    $or: [
+      { _id: new ObjectId(sessionId) },
+      { _id: sessionId },
+      { id: sessionId },
+    ],
+  });
+  assert.ok(sessionDoc, "JWT session must exist in the Better Auth session collection");
+  await db.collection("session").deleteOne({ _id: sessionDoc._id });
+  assert.equal((await rawProtected(validToken)).status, 401);
+  await db.collection("session").insertOne(sessionDoc);
+  assert.equal((await rawProtected(validToken)).status, 200);
+  pass("Revoked sessions invalidate otherwise valid JWTs until the session is restored");
+
   await signIn("login", email("customer"));
   await fetchToken("login");
   await api("login", "GET", "/api/users/me");
@@ -325,6 +403,13 @@ try {
     assert.equal(approved.message, "Pizza approved and published");
   }
   pass("Admin approval publishes pending items for the public menu");
+
+  for (let index = 0; index < 3; index += 1) {
+    await api("vendor", "PATCH", `/api/menu/vendor/${itemIds[index]}`, {
+      price: 20 + index,
+    });
+  }
+  pass("Vendor price updates are accepted on approved items");
 
   const downtownMenu = await api(null, "GET", "/api/menu?location=Downtown&limit=100");
   assert.ok(downtownMenu.items.length >= 3);
@@ -470,6 +555,48 @@ try {
   assert.equal(firstPublic.restaurant?.name, restaurant.restaurant.name);
   await api(null, "GET", `/api/menu/${itemIds[3]}`, undefined, 404);
   pass("Public browse exposes only approved active items with a restaurant summary");
+
+  const searchedMenu = await api(
+    null,
+    "GET",
+    `/api/menu?search=${encodeURIComponent("Integration Pizza 1")}&limit=50`,
+  );
+  assert.deepEqual(searchedMenu.items.map((item) => item.id), [itemIds[0]]);
+  const ascMenu = await api(
+    null,
+    "GET",
+    `/api/menu?restaurantId=${restaurant.restaurant.id}&sort=price_asc&limit=50`,
+  );
+  const descMenu = await api(
+    null,
+    "GET",
+    `/api/menu?restaurantId=${restaurant.restaurant.id}&sort=price_desc&limit=50`,
+  );
+  assert.deepEqual(ascMenu.items.map((item) => item.id), itemIds.slice(0, 3));
+  assert.deepEqual(descMenu.items.map((item) => item.id), [...itemIds.slice(0, 3)].reverse());
+  const middlePrice = firstPublic.price + 1;
+  const rangedMenu = await api(
+    null,
+    "GET",
+    `/api/menu?restaurantId=${restaurant.restaurant.id}&minPrice=${middlePrice}&maxPrice=${middlePrice}`,
+  );
+  assert.deepEqual(rangedMenu.items.map((item) => item.id), [itemIds[1]]);
+  const pageOne = await api(
+    null,
+    "GET",
+    `/api/menu?restaurantId=${restaurant.restaurant.id}&sort=price_asc&page=1&limit=2`,
+  );
+  const pageTwo = await api(
+    null,
+    "GET",
+    `/api/menu?restaurantId=${restaurant.restaurant.id}&sort=price_asc&page=2&limit=2`,
+  );
+  assert.equal(pageOne.pagination.total, 3);
+  assert.equal(pageOne.pagination.pages, 2);
+  assert.equal(pageOne.items.length, 2);
+  assert.equal(pageTwo.items.length, 1);
+  assert.equal(pageTwo.items[0].id, itemIds[2]);
+  pass("Public menu search, price sorting, bounds, and pagination work together");
 
   const unpublished = await api(
     "vendor",
@@ -903,6 +1030,9 @@ try {
     const result = await api("vendor", method, path, body);
     assert.equal(result.order.status, expectedStatus);
     assert.equal(result.order.timeline.length, previousLength + 1);
+    if (expectedStatus === "accepted") {
+      assert.ok(result.email && typeof result.email.sent === "boolean");
+    }
     previousLength = result.order.timeline.length;
   }
   pass("Order accept/status transitions append timeline entries");
@@ -910,6 +1040,29 @@ try {
   const repeat = await api("customer", "POST", "/api/orders", orderPayload, 201);
   await api("customer", "PATCH", `/api/orders/${repeat.order.id}/cancel`);
   pass("Delivered orders release the active-order slot");
+
+  const rejectable = await api(
+    "customer",
+    "POST",
+    "/api/orders",
+    { ...orderPayload, menuItemId: itemIds[1], quantity: 1 },
+    201,
+  );
+  const orderDetails = await api("customer", "GET", `/api/orders/${rejectable.order.id}`);
+  assert.equal(orderDetails.order.id, rejectable.order.id);
+  assert.ok(Array.isArray(orderDetails.order.timeline));
+  await api("otherVendor", "GET", `/api/orders/${rejectable.order.id}`, undefined, 403);
+  const rejectedOrder = await api(
+    "vendor",
+    "PATCH",
+    `/api/orders/${rejectable.order.id}/reject`,
+  );
+  assert.equal(rejectedOrder.order.status, "rejected");
+  assert.ok(rejectedOrder.email && typeof rejectedOrder.email.sent === "boolean");
+  const adminOrderDetails = await api("admin", "GET", `/api/orders/${rejectable.order.id}`);
+  assert.equal(adminOrderDetails.order.status, "rejected");
+  await api("vendor", "PATCH", `/api/orders/${rejectable.order.id}/accept`, undefined, 409);
+  pass("Order details enforce ownership and reject transitions return email status");
 
   await api(
     "customer",
@@ -926,6 +1079,82 @@ try {
   const reviews = await api(null, "GET", `/api/reviews/${itemIds[0]}`);
   assert.ok(reviews.reviews.some((review) => review.comment === "Delicious integration pizza"));
   pass("Customer can review a delivered pizza");
+
+  const restaurantReview = await api(
+    "customer",
+    "POST",
+    `/api/reviews/restaurant/${restaurant.restaurant.id}`,
+    {
+      orderId: order.id,
+      rating: 4,
+      comment: "A warm and welcoming integration kitchen",
+    },
+    201,
+  );
+  assert.equal(restaurantReview.review.restaurantId, restaurant.restaurant.id);
+  assert.equal(restaurantReview.review.menuItemId, null);
+  await api(
+    "customer",
+    "POST",
+    `/api/reviews/restaurant/${restaurant.restaurant.id}`,
+    {
+      orderId: order.id,
+      rating: 5,
+      comment: "Duplicate restaurant review attempt",
+    },
+    409,
+  );
+  await api(
+    "customer",
+    "POST",
+    `/api/reviews/restaurant/${foreignRestaurant.restaurant.id}`,
+    {
+      orderId: order.id,
+      rating: 5,
+      comment: "This order came from another kitchen",
+    },
+    400,
+  );
+  await api(
+    "vendor",
+    "POST",
+    `/api/reviews/restaurant/${restaurant.restaurant.id}`,
+    {
+      orderId: order.id,
+      rating: 5,
+      comment: "Vendors cannot review restaurants",
+    },
+    403,
+  );
+  await api(
+    null,
+    "POST",
+    `/api/reviews/restaurant/${restaurant.restaurant.id}`,
+    {
+      orderId: order.id,
+      rating: 5,
+      comment: "Guests cannot review restaurants",
+    },
+    401,
+  );
+  const restaurantReviews = await api(
+    null,
+    "GET",
+    `/api/reviews/restaurant/${restaurant.restaurant.id}?limit=20`,
+  );
+  assert.ok(
+    restaurantReviews.reviews.some(
+      (review) => review.comment === "A warm and welcoming integration kitchen",
+    ),
+  );
+  const ratedRestaurant = await api(
+    null,
+    "GET",
+    `/api/restaurants/${restaurant.restaurant.id}`,
+  );
+  assert.equal(ratedRestaurant.restaurant.reviewCount, 1);
+  assert.equal(ratedRestaurant.restaurant.ratingAvg, 4);
+  pass("Restaurant reviews validate delivery, dedupe, roles, and update restaurant ratings");
 
   const adminDeleted = await api(
     "admin",

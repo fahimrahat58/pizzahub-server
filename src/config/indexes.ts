@@ -122,6 +122,24 @@ export const createIndexes = async (): Promise<void> => {
       run: () => collections.reviews().createIndex({ menuItemId: 1, rating: -1 }),
     },
     {
+      name: "reviews.unique.restaurant",
+      run: () =>
+        collections
+          .reviews()
+          .createIndex(
+            { orderId: 1, restaurantId: 1 },
+            {
+              unique: true,
+              partialFilterExpression: { restaurantId: { $type: "objectId" } },
+              name: "reviews_one_per_order_restaurant",
+            },
+          ),
+    },
+    {
+      name: "reviews.restaurant",
+      run: () => collections.reviews().createIndex({ restaurantId: 1, rating: -1 }),
+    },
+    {
       name: "users.stripeCustomer",
       run: () =>
         collections.users().createIndex(

@@ -71,6 +71,7 @@ export const uploadToImgBb = async (image: ValidatedImage): Promise<string> => {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: form.toString(),
+    signal: AbortSignal.timeout(15_000),
   });
 
   const payload = (await response.json().catch(() => null)) as {
