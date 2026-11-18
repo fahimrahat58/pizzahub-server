@@ -4,7 +4,8 @@ import { stripeWebhook } from "../controllers/webhooks.controller.js";
 
 const router = Router();
 
-// Must be mounted before express.json(): Stripe verifies the raw body bytes.
-router.post("/stripe", express.raw({ type: "*/*" }), stripeWebhook);
+// Mounted at /api/stripe, so this is POST /api/stripe/webhook.
+// Must be registered before express.json(): Stripe verifies the raw body bytes.
+router.post("/webhook", express.raw({ type: "*/*" }), stripeWebhook);
 
 export default router;

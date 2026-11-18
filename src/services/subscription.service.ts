@@ -165,6 +165,7 @@ const priceIdOf = (subscription: StripeSubscriptionState): string | null => {
 const resolveVendor = async (
   subscription: StripeSubscriptionState,
   customerId: string,
+  eventId?: string,
 ): Promise<UserDoc | null> => {
   const metadataVendorId = subscription.metadata?.vendorId;
   const [byCustomer, bySubscription, byMetadata] = await Promise.all([
@@ -182,6 +183,23 @@ const resolveVendor = async (
     (value): value is UserDoc => value !== null,
   );
   const distinctOwners = new Set(candidates.map((value) => value._id.toHexString()));
+  const vendor = byCustomer ?? bySubscription ?? byMetadata ?? null;
+
+  console.log("Stripe subscription vendor lookup", {
+    eventId: eventId ?? null,
+    subscriptionId: subscription.id,
+    customerId,
+    metadataVendorId: metadataVendorId ?? null,
+    vendorId: vendor?._id.toHexString() ?? null,
+    matchedBy: byCustomer
+      ? "customer"
+      : bySubscription
+        ? "subscription"
+        : byMetadata
+          ? "metadata"
+          : "none",
+  });
+
   if (distinctOwners.size > 1) {
     console.warn("Stripe subscription ignored: conflicting ownership metadata", {
       subscriptionId: subscription.id,
@@ -190,7 +208,7 @@ const resolveVendor = async (
     return null;
   }
 
-  return byCustomer ?? bySubscription ?? byMetadata ?? null;
+  return vendor;
 };
 
 /**
@@ -210,7 +228,7 @@ export const syncSubscription = async (
     ...subscription
   } = input;
   const customerId = customerIdOf(subscription.customer);
-  const vendor = await resolveVendor(subscription, customerId);
+  const vendor = await resolveVendor(subscription, customerId, eventId);
 
   if (!vendor) {
     console.warn("Stripe subscription ignored: no matching vendor", {
@@ -286,36 +304,49 @@ export const syncSubscription = async (
 
   if (conditions.length > 0) filter.$and = conditions;
 
-  const updated = await collections.users().findOneAndUpdate(
-    filter,
-    {
-      $set: {
-        subscriptionPlan: plan,
-        subscriptionStatus: status,
-        billingPlanId: billingPlanIdOf(subscription.metadata) ?? vendor.billingPlanId ?? null,
-        stripePriceId: priceIdOf(subscription) ?? vendor.stripePriceId ?? null,
-        stripeCustomerId: customerId,
-        stripeSubscriptionId: subscription.id,
-        stripeCheckoutSessionId: checkoutSessionId ?? vendor.stripeCheckoutSessionId ?? null,
-        subscriptionExpiresAt: periodEnd > 0 ? new Date(periodEnd * 1000) : null,
-        cancelAtPeriodEnd: preserveCancelAtPeriodEnd
-          ? vendor.cancelAtPeriodEnd ?? false
-          : subscription.cancel_at_period_end === true,
-        subscriptionEventCreatedAt: eventAt,
-        subscriptionEventId: eventId ?? null,
-        updatedAt: new Date(),
-      },
+  const updateResult = await collections.users().updateOne(filter, {
+    $set: {
+      subscriptionPlan: plan,
+      subscriptionStatus: status,
+      billingPlanId: billingPlanIdOf(subscription.metadata) ?? vendor.billingPlanId ?? null,
+      stripePriceId: priceIdOf(subscription) ?? vendor.stripePriceId ?? null,
+      stripeCustomerId: customerId,
+      stripeSubscriptionId: subscription.id,
+      stripeCheckoutSessionId: checkoutSessionId ?? vendor.stripeCheckoutSessionId ?? null,
+      subscriptionExpiresAt: periodEnd > 0 ? new Date(periodEnd * 1000) : null,
+      cancelAtPeriodEnd: preserveCancelAtPeriodEnd
+        ? vendor.cancelAtPeriodEnd ?? false
+        : subscription.cancel_at_period_end === true,
+      subscriptionEventCreatedAt: eventAt,
+      subscriptionEventId: eventId ?? null,
+      updatedAt: new Date(),
     },
-    { returnDocument: "after" },
-  );
+  });
 
-  if (!updated) {
+  console.log("Stripe subscription MongoDB update", {
+    eventId: eventId ?? null,
+    subscriptionId: subscription.id,
+    vendorId: vendor._id.toHexString(),
+    matchedCount: updateResult.matchedCount,
+    modifiedCount: updateResult.modifiedCount,
+  });
+
+  if (updateResult.matchedCount === 0) {
     console.warn("Stripe subscription event was stale or superseded", {
       eventId: eventId ?? null,
       subscriptionId: subscription.id,
       vendorId: vendor._id.toHexString(),
     });
+    return null;
   }
+
+  // Read back the document written by this event. The conditional update above
+  // is the atomic guard; this lookup only supplies the post-update snapshot.
+  const updated = await collections.users().findOne(
+    eventId
+      ? { _id: vendor._id, role: "vendor", subscriptionEventId: eventId }
+      : { _id: vendor._id, role: "vendor" },
+  );
 
   return updated ?? null;
 };
@@ -344,6 +375,17 @@ export const syncCheckoutSession = async (
     (value): value is UserDoc => value !== null,
   );
   const distinctOwners = new Set(candidates.map((value) => value._id.toHexString()));
+  const vendor = byCustomer ?? byMetadata ?? null;
+
+  console.log("Stripe checkout vendor lookup", {
+    eventId: input.eventId,
+    sessionId: input.sessionId,
+    customerId: input.customerId ?? null,
+    metadataVendorId: metadataVendorId ?? null,
+    vendorId: vendor?._id.toHexString() ?? null,
+    matchedBy: byCustomer ? "customer" : byMetadata ? "metadata" : "none",
+  });
+
   if (distinctOwners.size > 1) {
     console.warn("Stripe checkout ignored: conflicting ownership metadata", {
       sessionId: input.sessionId,
@@ -352,7 +394,6 @@ export const syncCheckoutSession = async (
     return null;
   }
 
-  const vendor = byCustomer ?? byMetadata ?? null;
   if (!vendor) {
     console.warn("Stripe checkout ignored: no matching vendor", {
       sessionId: input.sessionId,
@@ -393,26 +434,38 @@ export const syncCheckoutSession = async (
     },
   ];
 
-  const updated = await collections.users().findOneAndUpdate(
-    filter,
-    {
-      $set: {
-        stripeCheckoutSessionId: input.sessionId,
-        checkoutEventCreatedAt: eventAt,
-        billingPlanId: input.plan ?? vendor.billingPlanId ?? null,
-        updatedAt: new Date(),
-      },
+  const updateResult = await collections.users().updateOne(filter, {
+    $set: {
+      stripeCheckoutSessionId: input.sessionId,
+      checkoutEventCreatedAt: eventAt,
+      billingPlanId: input.plan ?? vendor.billingPlanId ?? null,
+      updatedAt: new Date(),
     },
-    { returnDocument: "after" },
-  );
+  });
 
-  if (!updated) {
+  console.log("Stripe checkout MongoDB update", {
+    eventId: input.eventId,
+    sessionId: input.sessionId,
+    vendorId: vendor._id.toHexString(),
+    matchedCount: updateResult.matchedCount,
+    modifiedCount: updateResult.modifiedCount,
+  });
+
+  if (updateResult.matchedCount === 0) {
     console.warn("Stripe checkout event was stale or superseded", {
       eventId: input.eventId,
       sessionId: input.sessionId,
       vendorId: vendor._id.toHexString(),
     });
+    return null;
   }
+
+  const updated = await collections.users().findOne({
+    _id: vendor._id,
+    role: "vendor",
+    stripeCheckoutSessionId: input.sessionId,
+    checkoutEventCreatedAt: eventAt,
+  });
 
   return updated ?? null;
 };

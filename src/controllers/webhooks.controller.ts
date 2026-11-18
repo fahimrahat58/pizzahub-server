@@ -174,6 +174,10 @@ const applyEvent = async (event: Stripe.Event): Promise<void> => {
 
     default:
       // Unhandled events are still claimed so retries do not repeat work.
+      console.log("Stripe webhook event type not handled", {
+        eventId,
+        eventType: event.type,
+      });
       return;
   }
 
@@ -209,12 +213,20 @@ const applyEvent = async (event: Stripe.Event): Promise<void> => {
  * required by Stripe's signature verification.
  */
 export const stripeWebhook = asyncHandler(async (req: Request, res: Response) => {
+  const signature = req.headers["stripe-signature"];
+  console.log("Stripe webhook request received", {
+    method: req.method,
+    path: req.originalUrl,
+    signaturePresent: typeof signature === "string" && signature.length > 0,
+    contentType: req.headers["content-type"] ?? null,
+    bodyBytes: Buffer.isBuffer(req.body) ? req.body.length : null,
+  });
+
   if (!isStripeConfigured()) {
     res.status(503).json({ success: false, message: "Billing is not configured" });
     return;
   }
 
-  const signature = req.headers["stripe-signature"];
   if (typeof signature !== "string" || signature.length === 0) {
     res.status(400).json({ success: false, message: "Missing Stripe signature" });
     return;
@@ -238,8 +250,18 @@ export const stripeWebhook = asyncHandler(async (req: Request, res: Response) =>
     return;
   }
 
+  console.log("Stripe webhook signature verified", {
+    eventId: event.id,
+    eventType: event.type,
+    livemode: event.livemode,
+  });
+
   const claim = await claimStripeEvent(event.id, event.type);
   if (claim === "duplicate") {
+    console.log("Stripe webhook duplicate ignored", {
+      eventId: event.id,
+      eventType: event.type,
+    });
     res.json({ received: true, duplicate: true });
     return;
   }
@@ -247,6 +269,10 @@ export const stripeWebhook = asyncHandler(async (req: Request, res: Response) =>
   try {
     await applyEvent(event);
     await completeStripeEvent(event.id);
+    console.log("Stripe webhook processed", {
+      eventId: event.id,
+      eventType: event.type,
+    });
     res.json({ received: true });
   } catch (error) {
     // Release the claim so Stripe's automatic retry can process the event.

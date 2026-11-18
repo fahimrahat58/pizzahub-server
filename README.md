@@ -47,7 +47,7 @@ Stripe and email credentials are optional at startup. Billing endpoints return a
 - `/api/admin` — approvals and moderation
 - `/api/uploads/image` — validated ImgBB proxy
 - `/api/subscriptions` — vendor Premium Checkout and billing portal
-- `/api/webhooks/stripe` — raw-body signature verification and activation
+- `/api/stripe/webhook` — raw-body signature verification and activation
 - `/api/test` — integration probes
 
 ## Advanced menu query parameters
@@ -72,6 +72,6 @@ The client's `src/lib/api.ts` fetches `/api/auth/token`, caches it until near ex
 
 For local testing with onboarding/sandbox senders, set `NODE_ENV=development` and `RESEND_TEST_EMAIL=<verified-address>` in `pizzahub-server/.env`. The service then sends both new-order emails to that verified address while preserving the original order data and templates; production recipients are never overridden. Server logs state whether each message went to the `development test recipient (RESEND_TEST_EMAIL)` or the `original recipient`, including the resolved address, and never print the API key. A Resend 422 (unverified recipient) is returned as `email: { sent: false, warning: "Email provider rejected the message" }`; the order still succeeds.
 
-Stripe Checkout is redirect-based. The browser never activates Premium itself: `POST /api/webhooks/stripe` verifies the signature, records the event id for idempotency, and only then updates the subscription. Price IDs are server-side; product IDs are rejected at startup checks.
+Stripe Checkout is redirect-based. The browser never activates Premium itself: `POST /api/stripe/webhook` verifies the signature, records the event id for idempotency, and only then updates the subscription. Price IDs are server-side; product IDs are rejected at startup checks.
 
 See `../README.md` for the full stack overview and verification commands.

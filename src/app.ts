@@ -37,9 +37,9 @@ app.use(
     credentials: true,
   }),
 );
-// Stripe needs the untouched request body for signature verification, so this
-// route is registered BEFORE express.json().
-app.use("/api/webhooks", webhookRoutes);
+// Stripe calls POST /api/stripe/webhook. The router is mounted BEFORE
+// express.json() so signature verification receives the untouched raw bytes.
+app.use("/api/stripe", webhookRoutes);
 
 app.use(express.json({ limit: "8mb" }));
 

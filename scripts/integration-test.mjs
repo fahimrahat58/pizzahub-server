@@ -246,7 +246,7 @@ const sendWebhook = async (event, { validSignature = true, includeSignature = tr
   if (includeSignature) {
     headers["stripe-signature"] = `t=${timestamp},v1=${validSignature ? digest : "0".repeat(64)}`;
   }
-  const response = await fetch(`${API}/api/webhooks/stripe`, {
+  const response = await fetch(`${API}/api/stripe/webhook`, {
     method: "POST",
     headers,
     body: payload,
