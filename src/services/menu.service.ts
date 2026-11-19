@@ -197,6 +197,7 @@ export const restaurantLookup = {
           address: 1,
           image: 1,
           openingHours: 1,
+          isAvailable: 1,
         },
       },
     ],

@@ -6,8 +6,12 @@ import {
   getRestaurant,
   listMyRestaurants,
   listRestaurants,
+  patchMyRestaurant,
+  restaurantAvailabilitySchema,
+  restaurantPatchSchema,
   restaurantSchemaBody,
   saveMyRestaurant,
+  setMyRestaurantAvailability,
   updateMyRestaurant,
 } from "../controllers/restaurants.controller.js";
 import { requireRole, verifyToken } from "../middleware/auth.middleware.js";
@@ -31,6 +35,13 @@ router.put(
   validateBody(restaurantSchemaBody),
   saveMyRestaurant,
 );
+router.patch(
+  "/mine/:id/availability",
+  verifyToken,
+  requireRole("vendor"),
+  validateBody(restaurantAvailabilitySchema),
+  setMyRestaurantAvailability,
+);
 router.put(
   "/mine/:id",
   verifyToken,
@@ -42,8 +53,8 @@ router.patch(
   "/mine/:id",
   verifyToken,
   requireRole("vendor"),
-  validateBody(restaurantSchemaBody),
-  updateMyRestaurant,
+  validateBody(restaurantPatchSchema),
+  patchMyRestaurant,
 );
 router.delete("/mine", verifyToken, requireRole("vendor"), deleteMyRestaurant);
 router.delete(

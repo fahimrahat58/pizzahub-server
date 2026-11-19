@@ -122,8 +122,14 @@ export const createOrder = asyncHandler(async (req: Request, res: Response) => {
   const restaurant = item.restaurantId
     ? await collections
         .restaurants()
-        .findOne({ _id: item.restaurantId }, { projection: { name: 1 } })
+        .findOne(
+          { _id: item.restaurantId },
+          { projection: { name: 1, isAvailable: 1 } },
+        )
     : null;
+  if (restaurant?.isAvailable === false) {
+    throw notFound("This restaurant is currently unavailable");
+  }
 
   const now = new Date();
   const orderNumber = `PH-${now.toISOString().slice(0, 10).replace(/-/g, "")}-${randomBytes(3).toString("hex").toUpperCase()}`;

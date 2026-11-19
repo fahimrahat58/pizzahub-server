@@ -54,6 +54,7 @@ type RestaurantSummarySource = {
   address: string;
   image?: string | null;
   openingHours?: string | null;
+  isAvailable?: boolean | null;
 };
 
 type MenuEnrichment = {
@@ -89,6 +90,7 @@ const restaurantSummary = (
     address: source.address,
     image: source.image ?? null,
     openingHours: source.openingHours ?? null,
+    isAvailable: source.isAvailable !== false,
   };
 };
 
@@ -143,6 +145,7 @@ export const restaurantDto = (
   address: restaurant.address,
   phone: restaurant.phone,
   openingHours: restaurant.openingHours ?? null,
+  isAvailable: restaurant.isAvailable !== false,
   ratingAvg: rating?.ratingAvg ?? 0,
   reviewCount: rating?.reviewCount ?? 0,
   createdAt: restaurant.createdAt,

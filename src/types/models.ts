@@ -161,6 +161,8 @@ export interface RestaurantDoc {
   address: string;
   phone: string;
   openingHours?: string | null;
+  /** Absent on legacy restaurants, which are treated as available. */
+  isAvailable?: boolean;
   /** Internal, unique-per-vendor slot used to cap Free plan restaurants. */
   freeSlot?: number;
   createdAt: Date;

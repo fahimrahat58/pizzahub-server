@@ -7,7 +7,13 @@ import {
   RESTAURANT_LIMIT_MESSAGE,
   reserveFreeRestaurantSlot,
 } from "../services/restaurant.service.js";
-import { asyncHandler, badRequest, conflict, notFound } from "../utils/errors.js";
+import {
+  asyncHandler,
+  badRequest,
+  conflict,
+  forbidden,
+  notFound,
+} from "../utils/errors.js";
 import { isValidObjectId } from "../utils/query.js";
 import { restaurantDto } from "../utils/serialize.js";
 import type { RestaurantDoc } from "../types/models.js";
@@ -21,6 +27,18 @@ export const restaurantSchemaBody = z
     phone: z.string().trim().min(7).max(30),
     openingHours: z.string().trim().max(120).optional().nullable(),
   })
+  .strict();
+
+/** PATCH accepts only the supplied fields; unknown/protected keys are rejected. */
+export const restaurantPatchSchema = restaurantSchemaBody
+  .partial()
+  .strict()
+  .refine((data) => Object.keys(data).length > 0, {
+    message: "Provide at least one restaurant field to update",
+  });
+
+export const restaurantAvailabilitySchema = z
+  .object({ isAvailable: z.boolean() })
   .strict();
 
 type RestaurantRating = { ratingAvg: number; reviewCount: number };
@@ -147,23 +165,45 @@ export const createMyRestaurant = asyncHandler(
   },
 );
 
+/**
+ * Restaurant ids are public, so an existing id owned by someone else is a
+ * 403 rather than a disguised 404. Writes still filter by vendorId as well,
+ * which keeps the check safe if ownership changes concurrently.
+ */
+const requireOwnedRestaurant = async (
+  restaurantId: ObjectId,
+  vendorId: string,
+): Promise<void> => {
+  const restaurant = await collections.restaurants().findOne(
+    { _id: restaurantId },
+    { projection: { vendorId: 1 } },
+  );
+  if (!restaurant) throw notFound("Restaurant not found");
+  if (restaurant.vendorId !== vendorId) {
+    throw forbidden("You do not manage this restaurant");
+  }
+};
+
 const updateRestaurant = async (
   vendorId: string,
   restaurantId: string | undefined,
-  data: z.infer<typeof restaurantSchemaBody>,
+  data: z.infer<typeof restaurantPatchSchema>,
+  partial: boolean,
 ): Promise<RestaurantDoc> => {
   if (!restaurantId || !isValidObjectId(restaurantId)) {
     throw badRequest("Select a valid restaurant to update");
   }
+  const objectIdValue = new ObjectId(restaurantId);
+  await requireOwnedRestaurant(objectIdValue, vendorId);
+
+  const changes: Partial<RestaurantDoc> = { ...data, updatedAt: new Date() };
+  // Full PUT historically normalises a missing openingHours to null; PATCH
+  // leaves fields that were not submitted untouched.
+  if (!partial) changes.openingHours = data.openingHours ?? null;
+
   const restaurant = await collections.restaurants().findOneAndUpdate(
-    { _id: new ObjectId(restaurantId), vendorId },
-    {
-      $set: {
-        ...data,
-        openingHours: data.openingHours ?? null,
-        updatedAt: new Date(),
-      },
-    },
+    { _id: objectIdValue, vendorId },
+    { $set: changes },
     { returnDocument: "after" },
   );
   if (!restaurant) throw notFound("Restaurant not found");
@@ -177,10 +217,55 @@ export const updateMyRestaurant = asyncHandler(
       req.user!.id,
       String(req.params.id ?? req.query.id ?? ""),
       data,
+      false,
     );
     res.json({
       success: true,
       message: "Restaurant updated",
+      restaurant: restaurantDto(restaurant),
+    });
+  },
+);
+
+export const patchMyRestaurant = asyncHandler(
+  async (req: Request, res: Response) => {
+    const data = restaurantPatchSchema.parse(req.body);
+    const restaurant = await updateRestaurant(
+      req.user!.id,
+      String(req.params.id ?? req.query.id ?? ""),
+      data,
+      true,
+    );
+    res.json({
+      success: true,
+      message: "Restaurant updated",
+      restaurant: restaurantDto(restaurant),
+    });
+  },
+);
+
+export const setMyRestaurantAvailability = asyncHandler(
+  async (req: Request, res: Response) => {
+    const restaurantIdParam = String(req.params.id ?? "");
+    if (!isValidObjectId(restaurantIdParam)) {
+      throw badRequest("Select a valid restaurant to update");
+    }
+    const objectIdValue = new ObjectId(restaurantIdParam);
+    await requireOwnedRestaurant(objectIdValue, req.user!.id);
+
+    const { isAvailable } = restaurantAvailabilitySchema.parse(req.body);
+    const restaurant = await collections.restaurants().findOneAndUpdate(
+      { _id: objectIdValue, vendorId: req.user!.id },
+      { $set: { isAvailable, updatedAt: new Date() } },
+      { returnDocument: "after" },
+    );
+    if (!restaurant) throw notFound("Restaurant not found");
+
+    res.json({
+      success: true,
+      message: isAvailable
+        ? "Restaurant marked available"
+        : "Restaurant marked unavailable",
       restaurant: restaurantDto(restaurant),
     });
   },
@@ -192,7 +277,7 @@ export const saveMyRestaurant = asyncHandler(
     const data = restaurantSchemaBody.parse(req.body);
     const requestedId = String(req.query.id ?? "");
     if (requestedId) {
-      const restaurant = await updateRestaurant(req.user!.id, requestedId, data);
+      const restaurant = await updateRestaurant(req.user!.id, requestedId, data, false);
       res.json({
         success: true,
         message: "Restaurant saved",
@@ -214,6 +299,7 @@ export const saveMyRestaurant = asyncHandler(
             req.user!.id,
             existing[0]._id.toHexString(),
             data,
+            false,
           )
         : await insertRestaurant(req.user!.id, data);
     res.json({
@@ -240,6 +326,7 @@ export const deleteMyRestaurant = asyncHandler(
         throw badRequest("Select a valid restaurant to delete");
       }
       restaurantId = new ObjectId(requestedId);
+      await requireOwnedRestaurant(restaurantId, req.user!.id);
     } else {
       const restaurants = await collections
         .restaurants()
