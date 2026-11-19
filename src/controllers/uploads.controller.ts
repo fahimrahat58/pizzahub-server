@@ -1,7 +1,11 @@
 import type { Request, Response } from "express";
 
 import { ApiError, asyncHandler } from "../utils/errors.js";
-import { uploadToImgBb, validateImageInput } from "../services/image.service.js";
+import {
+  uploadToImgBb,
+  validateImageBytes,
+  validateImageInput,
+} from "../services/image.service.js";
 
 /** Simple per-IP throttle for the unauthenticated registration upload. */
 const uploadWindow = new Map<string, number[]>();
@@ -28,7 +32,10 @@ const throttle = (req: Request): void => {
 
 export const uploadImage = asyncHandler(async (req: Request, res: Response) => {
   throttle(req);
-  const image = validateImageInput(req.body);
+  const contentType = req.headers["content-type"]?.split(";")[0]?.trim().toLowerCase() ?? "";
+  const image = Buffer.isBuffer(req.body)
+    ? validateImageBytes(req.body, contentType)
+    : validateImageInput(req.body);
   const url = await uploadToImgBb(image);
 
   res.json({

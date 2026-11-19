@@ -96,7 +96,7 @@ const clientMessage = (error: unknown, status: number): string => {
   if (typeof error !== "object" || error === null) return "Invalid request";
   const type = (error as { type?: unknown }).type;
   if (type === "entity.too.large" || status === 413) {
-    return "The image is too large. Choose a file under 5 MB.";
+    return "The image is too large. Choose a smaller file.";
   }
   if (type === "entity.parse.failed") return "Invalid JSON request body";
   if (status === 400) return "Invalid request";

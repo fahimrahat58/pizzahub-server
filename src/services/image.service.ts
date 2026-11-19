@@ -41,6 +41,19 @@ export const validateImageInput = (input: unknown): ValidatedImage => {
   }
 
   const buffer = Buffer.from(base64, "base64");
+  return validateImageBytes(buffer, mime);
+};
+
+/**
+ * Validates a raw request body. Vercel caps function request bodies at 4.5 MB,
+ * so the client sends raw bytes instead of base64 JSON to avoid inflating the
+ * payload. The image bytes (and quality) are unchanged; only the encoding used
+ * on the wire differs.
+ */
+export const validateImageBytes = (buffer: Buffer, mime: string): ValidatedImage => {
+  if (!(mime in ALLOWED)) {
+    throw badRequest("Only JPG, PNG, WEBP and GIF images are allowed");
+  }
   if (buffer.length === 0 || buffer.length > MAX_IMAGE_BYTES) {
     throw badRequest("Image must be smaller than 5 MB");
   }
@@ -51,7 +64,11 @@ export const validateImageInput = (input: unknown): ValidatedImage => {
     throw badRequest("File content does not match the declared image type");
   }
 
-  return { mime: mime as AllowedMime, base64, bytes: buffer.length };
+  return {
+    mime: mime as AllowedMime,
+    base64: buffer.toString("base64"),
+    bytes: buffer.length,
+  };
 };
 
 /** Uploads to ImgBB. The API key never leaves the server. */
