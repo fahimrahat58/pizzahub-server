@@ -95,7 +95,8 @@ export const verifyToken = async (
     if (user.isBlocked === true) {
       res.status(403).json({
         success: false,
-        message: "Your account has been blocked. Contact support.",
+        code: "ACCOUNT_BLOCKED",
+        message: "Your account has been blocked",
       });
       return;
     }
