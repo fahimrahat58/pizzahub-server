@@ -15,7 +15,11 @@ import {
   updateProfileImage,
 } from "../controllers/users.controller.js";
 import { requireRole, verifyToken } from "../middleware/auth.middleware.js";
-import { validateBody } from "../middleware/validate.js";
+import {
+  validateBody,
+  validateParams,
+  objectIdParamSchema,
+} from "../middleware/validate.js";
 
 const router = Router();
 
@@ -39,11 +43,32 @@ router.get(
 router.get(
   "/admin/subscriptions/:id/history",
   requireRole("admin"),
+  validateParams(objectIdParamSchema),
   adminGetSubscriptionHistory,
 );
-router.get("/admin/:id", requireRole("admin"), adminGetUser);
-router.patch("/admin/:id/block", requireRole("admin"), adminSetBlocked);
-router.patch("/admin/:id/role", requireRole("admin"), adminChangeRole);
-router.delete("/admin/:id", requireRole("admin"), adminDeleteUser);
+router.get(
+  "/admin/:id",
+  requireRole("admin"),
+  validateParams(objectIdParamSchema),
+  adminGetUser,
+);
+router.patch(
+  "/admin/:id/block",
+  requireRole("admin"),
+  validateParams(objectIdParamSchema),
+  adminSetBlocked,
+);
+router.patch(
+  "/admin/:id/role",
+  requireRole("admin"),
+  validateParams(objectIdParamSchema),
+  adminChangeRole,
+);
+router.delete(
+  "/admin/:id",
+  requireRole("admin"),
+  validateParams(objectIdParamSchema),
+  adminDeleteUser,
+);
 
 export default router;

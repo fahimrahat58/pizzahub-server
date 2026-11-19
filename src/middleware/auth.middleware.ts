@@ -40,6 +40,9 @@ export const verifyToken = async (
     const { payload } = await jwtVerify(token, JWKS, {
       issuer: env.authUrl,
       audience: env.authUrl,
+      // Better Auth's default JWKS keyPairConfig is EdDSA / Ed25519 and this
+      // app does not override jwks.keyPairConfig or jwt.sign.
+      algorithms: ["EdDSA"],
     });
 
     const userId = payload.sub;
@@ -51,27 +54,29 @@ export const verifyToken = async (
     }
     const userObjectId = new ObjectId(userId);
 
-    if (typeof payload.sessionId === "string") {
-      if (!isValidObjectId(payload.sessionId)) {
-        res
-          .status(401)
-          .json({ success: false, message: "Invalid token payload" });
-        return;
-      }
-      // Better Auth's Mongo adapter stores session ids as ObjectIds in the
-      // singular `session` collection.
-      const session = await collections.sessions().findOne({
-        _id: new ObjectId(payload.sessionId),
-        userId: userObjectId,
-        expiresAt: { $gt: new Date() },
+    if (
+      typeof payload.sessionId !== "string" ||
+      !isValidObjectId(payload.sessionId)
+    ) {
+      res
+        .status(401)
+        .json({ success: false, message: "Invalid token payload" });
+      return;
+    }
+
+    // Better Auth's Mongo adapter stores session ids as ObjectIds in the
+    // singular `session` collection. Always verify the live session.
+    const session = await collections.sessions().findOne({
+      _id: new ObjectId(payload.sessionId),
+      userId: userObjectId,
+      expiresAt: { $gt: new Date() },
+    });
+    if (!session) {
+      res.status(401).json({
+        success: false,
+        message: "Session expired. Please sign in again.",
       });
-      if (!session) {
-        res.status(401).json({
-          success: false,
-          message: "Session expired. Please sign in again.",
-        });
-        return;
-      }
+      return;
     }
 
     const user = await collections.users().findOne(

@@ -296,10 +296,12 @@ export const updateReview = asyncHandler(async (req: Request, res: Response) => 
 
   const review = await collections.reviews().findOne({
     _id: reviewId,
-    customerId: req.user!.id,
     menuItemId: { $type: "objectId" },
   });
   if (!review) throw notFound("Review not found");
+  if (review.customerId !== req.user!.id) {
+    throw forbidden("You do not manage this review");
+  }
 
   const order = await collections.orders().findOne({
     _id: review.orderId,
@@ -340,14 +342,27 @@ export const deleteReview = asyncHandler(async (req: Request, res: Response) => 
   }
   if (!isValidObjectId(String(req.params.id))) throw notFound("Review not found");
 
+  const reviewId = new ObjectId(String(req.params.id));
   const deleted = await collections.reviews().findOneAndDelete({
-    _id: new ObjectId(String(req.params.id)),
+    _id: reviewId,
     customerId: req.user!.id,
     menuItemId: { $type: "objectId" },
   });
-  if (!deleted) throw notFound("Review not found");
+  if (deleted) {
+    res.json({ success: true, message: "Review removed" });
+    return;
+  }
 
-  res.json({ success: true, message: "Review removed" });
+  const foreign = await collections.reviews().findOne(
+    {
+      _id: reviewId,
+      customerId: { $ne: req.user!.id },
+      menuItemId: { $type: "objectId" },
+    },
+    { projection: { _id: 1 } },
+  );
+  if (foreign) throw forbidden("You do not manage this review");
+  throw notFound("Review not found");
 });
 
 /** Vendor-only view of reviews attached to menu items they own. */

@@ -11,7 +11,7 @@ import type { FavoriteDoc, MenuItemDoc } from "../types/models.js";
 
 const favoriteSchema = z.object({
   menuItemId: z.string().regex(/^[a-fA-F0-9]{24}$/, "Invalid pizza"),
-});
+}).strict();
 
 const assertCustomer = (req: Request): void => {
   if (req.user!.role !== "customer") {
@@ -51,11 +51,26 @@ export const removeFavorite = asyncHandler(
   async (req: Request, res: Response) => {
     assertCustomer(req);
     if (!isValidObjectId(String(req.params.id))) throw notFound("Favorite not found");
-    await collections.favorites().deleteOne({
+    const menuItemId = new ObjectId(String(req.params.id));
+
+    const deleted = await collections.favorites().findOneAndDelete({
       customerId: req.user!.id,
-      menuItemId: new ObjectId(String(req.params.id)),
+      menuItemId,
     });
-    res.json({ success: true, message: "Removed from favorites" });
+    if (deleted) {
+      res.json({ success: true, message: "Removed from favorites" });
+      return;
+    }
+
+    const foreign = await collections.favorites().findOne(
+      {
+        menuItemId,
+        customerId: { $ne: req.user!.id },
+      },
+      { projection: { _id: 1 } },
+    );
+    if (foreign) throw forbidden("You cannot remove another customer's favorite");
+    throw notFound("Favorite not found");
   },
 );
 

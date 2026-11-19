@@ -7,6 +7,7 @@ import {
   asyncHandler,
   badRequest,
   conflict,
+  forbidden,
   notFound,
 } from "../utils/errors.js";
 import { firstString, getPagination, isValidObjectId } from "../utils/query.js";
@@ -25,33 +26,38 @@ const objectId = z
 const FREE_LIMIT_MESSAGE =
   "Free vendors can have a maximum of 3 active menu items. Upgrade to Premium to add more.";
 
-export const createMenuItemSchema = z.object({
-  restaurantId: objectId.optional(),
-  name: z.string().trim().min(3).max(100),
-  description: z.string().trim().min(10).max(1000),
-  category: z.string().trim().min(2).max(40),
-  price: z.number().positive().max(1000),
-  ingredients: z.array(z.string().trim().min(1).max(60)).min(1).max(30),
-  // Menu items no longer ask for a location; the owning restaurant's address
-  // remains the location source. Kept optional for older clients and data.
-  location: z.string().trim().max(100).optional(),
-  image: imageUrl,
-  images: z.array(imageUrl).max(6).optional(),
-  isActive: z.boolean().optional(),
-});
+export const createMenuItemSchema = z
+  .object({
+    restaurantId: objectId.optional(),
+    name: z.string().trim().min(3).max(100),
+    description: z.string().trim().min(10).max(1000),
+    category: z.string().trim().min(2).max(40),
+    price: z.number().positive().max(1000),
+    ingredients: z.array(z.string().trim().min(1).max(60)).min(1).max(30),
+    // Menu items no longer ask for a location; the owning restaurant's address
+    // remains the location source. Kept optional for older clients and data.
+    location: z.string().trim().max(100).optional(),
+    image: imageUrl,
+    images: z.array(imageUrl).max(6).optional(),
+    isActive: z.boolean().optional(),
+  })
+  .strict();
 
+// Zod 4 .partial() preserves the strict catchall from createMenuItemSchema.
 export const updateMenuItemSchema = createMenuItemSchema
   .partial()
   .refine((value) => Object.keys(value).length > 0, {
     message: "No menu item changes provided",
   });
 
-export const approvalSchema = z.object({
-  approvalStatus: z.enum(["approved", "rejected"]),
-  isActive: z.boolean().optional(),
-  isFeatured: z.boolean().optional(),
-  rejectionReason: z.string().trim().max(300).optional(),
-});
+export const approvalSchema = z
+  .object({
+    approvalStatus: z.enum(["approved", "rejected"]),
+    isActive: z.boolean().optional(),
+    isFeatured: z.boolean().optional(),
+    rejectionReason: z.string().trim().max(300).optional(),
+  })
+  .strict();
 
 const escapeRegex = (value: string): string =>
   value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -97,9 +103,11 @@ const findOwnedRestaurant = async (
     }
     const restaurant = await collections.restaurants().findOne({
       _id: new ObjectId(requestedId),
-      vendorId,
     });
-    if (!restaurant) throw badRequest("Select one of your own restaurants");
+    if (!restaurant) throw notFound("Restaurant not found");
+    if (restaurant.vendorId !== vendorId) {
+      throw forbidden("You do not manage this restaurant");
+    }
     return restaurant;
   }
 
@@ -115,6 +123,18 @@ const findOwnedRestaurant = async (
     throw badRequest("Select which restaurant this menu item belongs to");
   }
   return restaurants[0];
+};
+
+const requireOwnedMenuItem = async (
+  itemId: ObjectId,
+  vendorId: string,
+): Promise<MenuItemDoc> => {
+  const item = await collections.menuItems().findOne({ _id: itemId });
+  if (!item) throw notFound("Pizza not found");
+  if (item.vendorId !== vendorId) {
+    throw forbidden("You do not manage this pizza");
+  }
+  return item;
 };
 
 const assertCanPublish = async (
@@ -140,6 +160,9 @@ export const listPublicMenu = asyncHandler(async (req: Request, res: Response) =
   const category = firstString(req.query.category)?.trim() ?? "";
   const location = firstString(req.query.location)?.trim() ?? "";
   const vendorId = firstString(req.query.vendorId)?.trim() ?? "";
+  if (vendorId && !isValidObjectId(vendorId)) {
+    throw badRequest("Invalid vendor filter");
+  }
   const restaurantId = parseRestaurantFilter(req.query.restaurantId);
   const minPrice = parseNumber(req.query.minPrice);
   const maxPrice = parseNumber(req.query.maxPrice);
@@ -216,17 +239,9 @@ export const getPublicMenuItem = asyncHandler(
     if (!isValidObjectId(String(req.params.id))) throw notFound("Pizza not found");
     const objectIdValue = new ObjectId(String(req.params.id));
 
-    const isPrivileged =
-      req.user?.role === "admin" ||
-      (req.user?.role === "vendor" &&
-        (await collections.menuItems().findOne(
-          { _id: objectIdValue, vendorId: req.user.id },
-          { projection: { _id: 1 } },
-        )) !== null);
-
-    const filter: Document = isPrivileged
-      ? { _id: objectIdValue }
-      : { _id: objectIdValue, ...publicFilter() };
+    // Public discovery only. Admin/vendor privileged visibility belongs on
+    // /api/menu/admin/* and /api/menu/vendor/mine, never on this route.
+    const filter: Document = { _id: objectIdValue, ...publicFilter() };
 
     const [item] = await collections
       .menuItems()
@@ -305,11 +320,7 @@ export const updateMenuItem = asyncHandler(async (req: Request, res: Response) =
   const data = updateMenuItemSchema.parse(req.body);
   const itemId = new ObjectId(String(req.params.id));
 
-  const existing = await collections.menuItems().findOne({
-    _id: itemId,
-    vendorId: req.user!.id,
-  });
-  if (!existing) throw notFound("Pizza not found");
+  const existing = await requireOwnedMenuItem(itemId, req.user!.id);
 
   const requestedRestaurantId =
     data.restaurantId ?? existing.restaurantId?.toHexString() ?? null;
@@ -360,6 +371,7 @@ export const updateMenuItem = asyncHandler(async (req: Request, res: Response) =
 export const deleteMenuItem = asyncHandler(async (req: Request, res: Response) => {
   if (!isValidObjectId(String(req.params.id))) throw notFound("Pizza not found");
   const itemId = new ObjectId(String(req.params.id));
+  await requireOwnedMenuItem(itemId, req.user!.id);
   const deleted = await collections.menuItems().deleteOne({
     _id: itemId,
     vendorId: req.user!.id,
@@ -372,14 +384,10 @@ export const deleteMenuItem = asyncHandler(async (req: Request, res: Response) =
 export const toggleMenuItemActive = asyncHandler(
   async (req: Request, res: Response) => {
     if (!isValidObjectId(String(req.params.id))) throw notFound("Pizza not found");
-    const { isActive } = z.object({ isActive: z.boolean() }).parse(req.body);
+    const { isActive } = z.object({ isActive: z.boolean() }).strict().parse(req.body);
     const itemId = new ObjectId(String(req.params.id));
 
-    const item = await collections.menuItems().findOne({
-      _id: itemId,
-      vendorId: req.user!.id,
-    });
-    if (!item) throw notFound("Pizza not found");
+    const item = await requireOwnedMenuItem(itemId, req.user!.id);
 
     if (isActive && item.approvalStatus === "rejected") {
       throw conflict("This item was removed by an administrator");

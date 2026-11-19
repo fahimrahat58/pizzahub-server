@@ -384,6 +384,11 @@ try {
   const tokenHeader = decodeProtectedHeader(validToken);
   const tokenClaims = decodeJwt(validToken);
   assert.ok(tokenHeader.alg && tokenHeader.kid, "issued JWT must carry alg and kid");
+  assert.equal(
+    tokenHeader.alg,
+    "EdDSA",
+    "Better Auth default JWKS signing algorithm must be EdDSA",
+  );
   const jwkDoc = await db.collection("jwks").findOne({
     $or: [
       { id: tokenHeader.kid },
@@ -417,7 +422,28 @@ try {
     .setExpirationTime(nowSeconds + 300)
     .sign(signingKey);
   assert.equal((await rawProtected(wrongIssuerToken)).status, 401);
-  pass("Tampered, expired, and wrong-issuer JWTs are rejected");
+
+  const missingSessionToken = await new SignJWT({})
+    .setProtectedHeader({ alg: tokenHeader.alg, kid: tokenHeader.kid })
+    .setSubject(String(tokenClaims.sub))
+    .setIssuer(String(tokenClaims.iss))
+    .setAudience(String(tokenClaims.aud))
+    .setIssuedAt(nowSeconds)
+    .setExpirationTime(nowSeconds + 300)
+    .sign(signingKey);
+  assert.equal((await rawProtected(missingSessionToken)).status, 401);
+
+  const nonStringSessionToken = await new SignJWT({ sessionId: 123 })
+    .setProtectedHeader({ alg: tokenHeader.alg, kid: tokenHeader.kid })
+    .setSubject(String(tokenClaims.sub))
+    .setIssuer(String(tokenClaims.iss))
+    .setAudience(String(tokenClaims.aud))
+    .setIssuedAt(nowSeconds)
+    .setExpirationTime(nowSeconds + 300)
+    .sign(signingKey);
+  assert.equal((await rawProtected(nonStringSessionToken)).status, 401);
+
+  pass("Tampered, expired, wrong-issuer, and missing/invalid-session JWTs are rejected");
 
   const sessionId = String(tokenClaims.sessionId ?? "");
   assert.match(sessionId, /^[a-fA-F0-9]{24}$/, "JWT must carry the Better Auth session id");
@@ -671,10 +697,17 @@ try {
     "PATCH",
     `/api/menu/vendor/${itemIds[0]}`,
     { name: "Stolen Pizza" },
-    404,
+    403,
   );
-  await api("otherVendor", "DELETE", `/api/menu/vendor/${itemIds[0]}`, undefined, 404);
-  pass("A vendor cannot edit or delete another vendor's menu items");
+  await api("otherVendor", "DELETE", `/api/menu/vendor/${itemIds[0]}`, undefined, 403);
+  await api(
+    "otherVendor",
+    "PATCH",
+    `/api/menu/vendor/${itemIds[0]}/active`,
+    { isActive: false },
+    403,
+  );
+  pass("A vendor cannot edit, delete, or unpublish another vendor's menu items");
 
   // --- Restaurant association rules ----------------------------------------
   const secondRestaurant = await api(
@@ -734,10 +767,20 @@ try {
     "POST",
     "/api/menu/vendor",
     {
-      ...menuPayload("Integration Pizza Bad Restaurant"),
-      restaurantId: new ObjectId().toHexString(),
+      ...menuPayload("Integration Pizza Bad Shape"),
+      restaurantId: "not-an-object-id",
     },
     400,
+  );
+  await api(
+    "vendor",
+    "POST",
+    "/api/menu/vendor",
+    {
+      ...menuPayload("Integration Pizza Nonexistent Restaurant"),
+      restaurantId: new ObjectId().toHexString(),
+    },
+    404,
   );
   await api(
     "vendor",
@@ -747,9 +790,9 @@ try {
       ...menuPayload("Integration Pizza Foreign Restaurant"),
       restaurantId: foreignRestaurant.restaurant.id,
     },
-    400,
+    403,
   );
-  pass("With multiple restaurants an owned ID is required; missing, invalid, and foreign IDs are rejected");
+  pass("With multiple restaurants an owned ID is required; malformed, missing, and foreign IDs return distinct statuses");
 
   // --- Admin visibility, unpublish/republish, and takedown ------------------
   const adminAll = await api("admin", "GET", "/api/menu/admin/all?limit=100");
@@ -780,7 +823,9 @@ try {
   assert.equal(firstPublic.restaurant?.id, restaurant.restaurant.id);
   assert.equal(firstPublic.restaurant?.name, restaurant.restaurant.name);
   await api(null, "GET", `/api/menu/${itemIds[3]}`, undefined, 404);
-  pass("Public browse exposes only approved active items with a restaurant summary");
+  await api("vendor", "GET", `/api/menu/${itemIds[3]}`, undefined, 404);
+  await api("admin", "GET", `/api/menu/${itemIds[3]}`, undefined, 404);
+  pass("Public browse/detail exposes only approved active items, even with admin/vendor tokens");
 
   const searchedMenu = await api(
     null,
@@ -1440,10 +1485,24 @@ try {
   await api("customer", "POST", "/api/favorites", { menuItemId: itemIds[0] }, 201);
   const favoriteIds = await api("customer", "GET", "/api/favorites/ids");
   assert.ok(favoriteIds.ids.includes(itemIds[0]));
+  await api(
+    "otherCustomer",
+    "DELETE",
+    `/api/favorites/${itemIds[0]}`,
+    undefined,
+    403,
+  );
+  await api(
+    "customer",
+    "DELETE",
+    `/api/favorites/${new ObjectId().toHexString()}`,
+    undefined,
+    404,
+  );
   await api("customer", "DELETE", `/api/favorites/${itemIds[0]}`);
   const cleared = await api("customer", "GET", "/api/favorites/ids");
   assert.ok(!cleared.ids.includes(itemIds[0]));
-  pass("Favorites add, list, and remove work");
+  pass("Favorites add/list/remove work; foreign delete is 403 and missing delete is 404");
 
   const deliveryDate = new Date().toISOString().slice(0, 10);
   const orderPayload = {
@@ -1535,6 +1594,37 @@ try {
       assert.equal(result.order.status, expectedStatus);
     }
   };
+
+  const raceOrder = await api(
+    "customer",
+    "POST",
+    "/api/orders",
+    { ...orderPayload, menuItemId: itemIds[2], quantity: 1 },
+    201,
+  );
+  const concurrentAccepts = await Promise.all([
+    rawApi("vendor", "PATCH", `/api/orders/${raceOrder.order.id}/accept`),
+    rawApi("vendor", "PATCH", `/api/orders/${raceOrder.order.id}/accept`),
+  ]);
+  assert.deepEqual(
+    concurrentAccepts.map((entry) => entry.status).sort((a, b) => a - b),
+    [200, 409],
+    "only one concurrent accept may succeed",
+  );
+  const persistedRaceOrder = await db
+    .collection("orders")
+    .findOne({ _id: new ObjectId(raceOrder.order.id) });
+  assert.equal(
+    persistedRaceOrder.timeline.filter((entry) => entry.status === "accepted").length,
+    1,
+    "the losing accept must not append a duplicate timeline entry",
+  );
+  for (const nextStatus of ["preparing", "out_for_delivery", "delivered"]) {
+    await api("vendor", "PATCH", `/api/orders/${raceOrder.order.id}/status`, {
+      status: nextStatus,
+    });
+  }
+  pass("Concurrent order transitions are atomic and do not duplicate timeline entries");
 
   // 1. Identity is always derived from the authenticated user.
   await api(
@@ -1765,14 +1855,14 @@ try {
     "PATCH",
     `/api/reviews/mine/${moderationReview.review.id}`,
     { rating: 5, comment: "Hijacked review" },
-    404,
+    403,
   );
   await api(
     "otherCustomer",
     "DELETE",
     `/api/reviews/mine/${moderationReview.review.id}`,
     undefined,
-    404,
+    403,
   );
   await api(
     "vendor",
@@ -1964,11 +2054,27 @@ try {
   await api("admin", "PATCH", `/api/users/admin/${vendor.id}/role`, { role: "vendor" });
   pass("Admin can search users and change roles");
 
+  await api(
+    "admin",
+    "PATCH",
+    `/api/users/admin/${adminCandidate.id}/block`,
+    { isBlocked: true },
+    403,
+  );
+  await api(
+    "admin",
+    "PATCH",
+    `/api/users/admin/${adminCandidate.id}/role`,
+    { role: "vendor" },
+    403,
+  );
+  await api("admin", "DELETE", `/api/users/admin/${adminCandidate.id}`, undefined, 403);
+
   await api("admin", "PATCH", `/api/users/admin/${customer.id}/block`, { isBlocked: true });
   await api("customer", "GET", "/api/orders/my", undefined, 403);
   await api("admin", "PATCH", `/api/users/admin/${customer.id}/block`, { isBlocked: false });
   await api("customer", "GET", "/api/orders/my");
-  pass("Blocked users are rejected by the API and can be unblocked");
+  pass("Blocked users are rejected by the API and admin self-protection returns 403");
 
   const png =
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";

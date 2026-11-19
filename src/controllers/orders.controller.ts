@@ -24,19 +24,23 @@ import {
   type TimelineEntry,
 } from "../types/models.js";
 
-const createOrderSchema = z.object({
-  menuItemId: z.string().regex(/^[a-fA-F0-9]{24}$/, "Invalid pizza"),
-  quantity: z.number().int().min(1).max(20),
-  deliveryAddress: z.string().trim().min(10).max(300),
-  deliveryDate: z
-    .string()
-    .regex(/^\d{4}-\d{2}-\d{2}$/, "Select a valid delivery date"),
-  message: z.string().trim().max(500).optional().default(""),
-});
+const createOrderSchema = z
+  .object({
+    menuItemId: z.string().regex(/^[a-fA-F0-9]{24}$/, "Invalid pizza"),
+    quantity: z.number().int().min(1).max(20),
+    deliveryAddress: z.string().trim().min(10).max(300),
+    deliveryDate: z
+      .string()
+      .regex(/^\d{4}-\d{2}-\d{2}$/, "Select a valid delivery date"),
+    message: z.string().trim().max(500).optional().default(""),
+  })
+  .strict();
 
-const statusSchema = z.object({
-  status: z.enum(["preparing", "out_for_delivery", "delivered"]),
-});
+export const statusSchema = z
+  .object({
+    status: z.enum(["preparing", "out_for_delivery", "delivered"]),
+  })
+  .strict();
 
 const dateIsValid = (value: string): boolean => {
   const date = new Date(`${value}T00:00:00Z`);
@@ -70,21 +74,42 @@ const entry = (status: OrderStatus, by: TimelineEntry["by"], note?: string): Tim
   at: new Date(),
 });
 
+type RequestUser = NonNullable<Request["user"]>;
+
+const orderAccessFilter = (user: RequestUser): Document => {
+  if (user.role === "customer") return { customerId: user.id };
+  if (user.role === "vendor") return { vendorId: user.id };
+  return {};
+};
+
+const canAccessOrder = (order: OrderDoc, user: RequestUser): boolean =>
+  user.role === "admin" ||
+  (user.role === "customer" && order.customerId === user.id) ||
+  (user.role === "vendor" && order.vendorId === user.id);
+
 const findOrderForRequest = async (
   req: Request,
 ): Promise<OrderDoc> => {
   if (!isValidObjectId(String(req.params.id))) throw notFound("Order not found");
-  const order = await collections
-    .orders()
-    .findOne({ _id: new ObjectId(String(req.params.id)) });
-  if (!order) throw notFound("Order not found");
-
+  const orderId = new ObjectId(String(req.params.id));
   const user = req.user!;
-  const allowed =
-    user.role === "admin" ||
-    (user.role === "customer" && order.customerId === user.id) ||
-    (user.role === "vendor" && order.vendorId === user.id);
-  if (!allowed) throw forbidden("You cannot access this order");
+  const accessFilter = orderAccessFilter(user);
+
+  const order = await collections.orders().findOne({
+    _id: orderId,
+    ...accessFilter,
+  });
+  if (!order) {
+    if (Object.keys(accessFilter).length === 0) {
+      throw notFound("Order not found");
+    }
+    const exists = await collections.orders().findOne(
+      { _id: orderId },
+      { projection: { _id: 1 } },
+    );
+    if (!exists) throw notFound("Order not found");
+    throw forbidden("You cannot access this order");
+  }
   return order;
 };
 
@@ -390,18 +415,41 @@ const changeStatus = async (
 
   const isTerminal = ["delivered", "cancelled", "rejected"].includes(nextStatus);
   const updated = await collections.orders().findOneAndUpdate(
-    { _id: order._id },
     {
-      $set: {
-        status: nextStatus,
-        timeline: [...order.timeline, entry(nextStatus, by, note)],
-        updatedAt: new Date(),
-      },
-      ...(isTerminal ? { $unset: { activeOrderKey: "" } } : {}),
+      _id: order._id,
+      status: { $in: allowedFrom },
+      ...orderAccessFilter(req.user!),
     },
+    [
+      {
+        $set: {
+          status: nextStatus,
+          timeline: {
+            $concatArrays: [
+              { $ifNull: ["$timeline", []] },
+              [entry(nextStatus, by, note)],
+            ],
+          },
+          updatedAt: new Date(),
+        },
+      },
+      ...(isTerminal ? [{ $unset: "activeOrderKey" }] : []),
+    ],
     { returnDocument: "after" },
   );
-  if (!updated) throw notFound("Order not found");
+  if (!updated) {
+    const current = await collections.orders().findOne(
+      { _id: order._id },
+      { projection: { status: 1, customerId: 1, vendorId: 1 } },
+    );
+    if (!current) throw notFound("Order not found");
+    if (!canAccessOrder(current, req.user!)) {
+      throw forbidden("You cannot access this order");
+    }
+    throw conflict(
+      `This order cannot be updated from status "${current.status}" to "${nextStatus}"`,
+    );
+  }
   const names = await restaurantNamesForOrders([updated]);
   const restaurantName =
     names.get(updated.menuItemId.toHexString()) ??

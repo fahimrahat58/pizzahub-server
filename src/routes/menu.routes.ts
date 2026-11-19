@@ -21,7 +21,11 @@ import {
   updateMenuItemSchema,
 } from "../controllers/menu.controller.js";
 import { requireRole, verifyToken } from "../middleware/auth.middleware.js";
-import { validateBody } from "../middleware/validate.js";
+import {
+  validateBody,
+  validateParams,
+  objectIdParamSchema,
+} from "../middleware/validate.js";
 
 const router = Router();
 
@@ -44,6 +48,7 @@ router.patch(
   "/vendor/:id",
   verifyToken,
   requireRole("vendor"),
+  validateParams(objectIdParamSchema),
   validateBody(updateMenuItemSchema),
   updateMenuItem,
 );
@@ -51,13 +56,15 @@ router.delete(
   "/vendor/:id",
   verifyToken,
   requireRole("vendor"),
+  validateParams(objectIdParamSchema),
   deleteMenuItem,
 );
 router.patch(
   "/vendor/:id/active",
   verifyToken,
   requireRole("vendor"),
-  validateBody(z.object({ isActive: z.boolean() })),
+  validateParams(objectIdParamSchema),
+  validateBody(z.object({ isActive: z.boolean() }).strict()),
   toggleMenuItemActive,
 );
 
@@ -69,6 +76,7 @@ router.patch(
   "/admin/:id/approval",
   verifyToken,
   requireRole("admin"),
+  validateParams(objectIdParamSchema),
   validateBody(approvalSchema),
   reviewMenuItem,
 );
@@ -76,10 +84,11 @@ router.delete(
   "/admin/:id",
   verifyToken,
   requireRole("admin"),
+  validateParams(objectIdParamSchema),
   adminDeleteMenuItem,
 );
 
 // Dynamic public detail route last
-router.get("/:id", getPublicMenuItem);
+router.get("/:id", validateParams(objectIdParamSchema), getPublicMenuItem);
 
 export default router;

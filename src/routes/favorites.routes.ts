@@ -8,7 +8,11 @@ import {
   removeFavorite,
 } from "../controllers/favorites.controller.js";
 import { requireRole, verifyToken } from "../middleware/auth.middleware.js";
-import { validateBody } from "../middleware/validate.js";
+import {
+  validateBody,
+  validateParams,
+  objectIdParamSchema,
+} from "../middleware/validate.js";
 
 const router = Router();
 
@@ -21,10 +25,10 @@ router.post(
   validateBody(
     z.object({
       menuItemId: z.string().regex(/^[a-fA-F0-9]{24}$/, "Invalid pizza"),
-    }),
+    }).strict(),
   ),
   addFavorite,
 );
-router.delete("/:id", removeFavorite);
+router.delete("/:id", validateParams(objectIdParamSchema), removeFavorite);
 
 export default router;

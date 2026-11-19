@@ -141,22 +141,40 @@ export const adminGetUser = asyncHandler(async (req: Request, res: Response) => 
   res.json({ success: true, user: userDto(user) });
 });
 
-const blockSchema = z.object({ isBlocked: z.boolean() });
-const roleSchema = z.object({ role: z.enum(["customer", "vendor"]) });
+const blockSchema = z.object({ isBlocked: z.boolean() }).strict();
+const roleSchema = z.object({ role: z.enum(["customer", "vendor"]) }).strict();
 
 export const adminSetBlocked = asyncHandler(
   async (req: Request, res: Response) => {
     const { isBlocked } = blockSchema.parse(req.body);
+    const targetFilter = userIdFilter(String(req.params.id));
     if (String(req.params.id) === req.user!.id) {
-      throw badRequest("You cannot block your own account");
+      throw forbidden("You cannot block your own account");
+    }
+
+    const target = await collections.users().findOne(targetFilter, {
+      projection: { role: 1 },
+    });
+    if (!target) throw notFound("User not found");
+    if (target.role === "admin") {
+      throw forbidden("Admin accounts cannot be blocked through this endpoint");
     }
 
     const user = await collections.users().findOneAndUpdate(
-      userIdFilter(String(req.params.id)),
+      { ...targetFilter, role: { $ne: "admin" } },
       { $set: { isBlocked, updatedAt: new Date() } },
       { returnDocument: "after" },
     );
-    if (!user) throw notFound("User not found");
+    if (!user) {
+      const current = await collections.users().findOne(targetFilter, {
+        projection: { role: 1 },
+      });
+      if (!current) throw notFound("User not found");
+      if (current.role === "admin") {
+        throw forbidden("Admin accounts cannot be blocked through this endpoint");
+      }
+      throw conflict("User state changed during this request");
+    }
 
     res.json({
       success: true,
@@ -169,22 +187,34 @@ export const adminSetBlocked = asyncHandler(
 export const adminChangeRole = asyncHandler(
   async (req: Request, res: Response) => {
     const { role } = roleSchema.parse(req.body);
+    const targetFilter = userIdFilter(String(req.params.id));
     if (String(req.params.id) === req.user!.id) {
-      throw badRequest("You cannot change your own role");
+      throw forbidden("You cannot change your own role");
     }
 
-    const target = await collections.users().findOne(userIdFilter(String(req.params.id)));
+    const target = await collections.users().findOne(targetFilter, {
+      projection: { role: 1 },
+    });
     if (!target) throw notFound("User not found");
     if (target.role === "admin") {
       throw forbidden("Admin accounts cannot be changed through this endpoint");
     }
 
     const user = await collections.users().findOneAndUpdate(
-      userIdFilter(String(req.params.id)),
+      { ...targetFilter, role: target.role },
       { $set: { role, updatedAt: new Date() } },
       { returnDocument: "after" },
     );
-    if (!user) throw notFound("User not found");
+    if (!user) {
+      const current = await collections.users().findOne(targetFilter, {
+        projection: { role: 1 },
+      });
+      if (!current) throw notFound("User not found");
+      if (current.role === "admin") {
+        throw forbidden("Admin accounts cannot be changed through this endpoint");
+      }
+      throw conflict("User state changed during this request");
+    }
 
     res.json({
       success: true,
@@ -205,10 +235,11 @@ export const adminDeleteUser = asyncHandler(
   async (req: Request, res: Response) => {
     const id = String(req.params.id);
     if (id === req.user!.id) {
-      throw badRequest("You cannot delete your own account");
+      throw forbidden("You cannot delete your own account");
     }
 
-    const target = await collections.users().findOne(userIdFilter(id));
+    const targetFilter = userIdFilter(id);
+    const target = await collections.users().findOne(targetFilter);
     if (!target) throw notFound("User not found");
     if (target.role === "admin") {
       throw forbidden("Admin accounts cannot be deleted through this endpoint");
@@ -288,8 +319,20 @@ export const adminDeleteUser = asyncHandler(
       }),
     ]);
     await collections.restaurants().deleteMany({ vendorId: id });
-    const deleted = await collections.users().deleteOne({ _id: targetObjectId });
-    if (deleted.deletedCount === 0) throw notFound("User not found");
+    const deleted = await collections.users().findOneAndDelete({
+      ...targetFilter,
+      role: { $ne: "admin" },
+    });
+    if (!deleted) {
+      const current = await collections.users().findOne(targetFilter, {
+        projection: { role: 1 },
+      });
+      if (!current) throw notFound("User not found");
+      if (current.role === "admin") {
+        throw forbidden("Admin accounts cannot be deleted through this endpoint");
+      }
+      throw conflict("User state changed during this request");
+    }
 
     res.json({
       success: true,
