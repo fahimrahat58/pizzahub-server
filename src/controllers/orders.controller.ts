@@ -49,6 +49,20 @@ const dateIsValid = (value: string): boolean => {
   return date.getTime() >= startOfToday.getTime();
 };
 
+/**
+ * `deliveryDate` is a date-only string (YYYY-MM-DD), not a UTC instant. Compare
+ * calendar dates using the server's configured delivery timezone (`TZ`) so a
+ * delivery is not accepted a day early just because UTC is still yesterday.
+ * Malformed legacy values are left deliverable rather than permanently stuck.
+ */
+const deliveryDateReached = (value: string, now: Date = new Date()): boolean => {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return true;
+  const year = now.getFullYear();
+  const month = String(now.getMonth() + 1).padStart(2, "0");
+  const day = String(now.getDate()).padStart(2, "0");
+  return value <= `${year}-${month}-${day}`;
+};
+
 const entry = (status: OrderStatus, by: TimelineEntry["by"], note?: string): TimelineEntry => ({
   status,
   by,
@@ -361,6 +375,11 @@ const changeStatus = async (
   }
   if (req.user!.role !== by && !(by === "vendor" && req.user!.role === "vendor")) {
     throw forbidden("You cannot perform this action");
+  }
+  if (nextStatus === "delivered" && !deliveryDateReached(order.deliveryDate)) {
+    throw badRequest(
+      `This order cannot be marked as Delivered before the customer's requested delivery date (${order.deliveryDate}).`,
+    );
   }
 
   const isTerminal = ["delivered", "cancelled", "rejected"].includes(nextStatus);
