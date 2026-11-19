@@ -8,8 +8,10 @@ import {
   listAllOrders,
   listMyOrders,
   listVendorOrders,
+  markVendorOrdersSeen,
   rejectOrder,
   updateOrderStatus,
+  getVendorUnseenOrderCount,
 } from "../controllers/orders.controller.js";
 import { requireRole, verifyToken } from "../middleware/auth.middleware.js";
 
@@ -22,6 +24,8 @@ router.post("/", requireRole("customer"), createOrder);
 router.get("/my", requireRole("customer"), listMyOrders);
 router.get("/vendor", requireRole("vendor"), listVendorOrders);
 router.get("/admin", requireRole("admin"), listAllOrders);
+router.get("/vendor/unseen", requireRole("vendor"), getVendorUnseenOrderCount);
+router.post("/vendor/seen", requireRole("vendor"), markVendorOrdersSeen);
 
 router.get("/:id", getOrder);
 router.patch("/:id/cancel", requireRole("customer"), cancelOrder);

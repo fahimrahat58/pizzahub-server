@@ -63,6 +63,8 @@ export interface UserDoc {
   /** Event timestamp/ID of the last accepted subscription state change. */
   subscriptionEventCreatedAt?: Date | null;
   subscriptionEventId?: string | null;
+  /** Orders created after this point are unseen by this vendor. */
+  vendorOrdersSeenAt?: Date | null;
   createdAt: Date;
   updatedAt: Date;
 }

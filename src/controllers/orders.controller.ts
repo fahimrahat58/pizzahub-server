@@ -280,6 +280,47 @@ export const listAllOrders = asyncHandler((req: Request, res: Response) =>
   listOrders(req, res, "all"),
 );
 
+/**
+ * New-order badge for the vendor dashboard. The seen marker lives on the
+ * vendor's own user document, so counting is scoped to their orders and a
+ * refresh/page reload cannot lose the state.
+ */
+export const getVendorUnseenOrderCount = asyncHandler(async (req: Request, res: Response) => {
+  const vendorId = req.user!.id;
+  const userFilter = { _id: new ObjectId(vendorId) };
+  const user = await collections.users().findOne(userFilter);
+
+  if (!user?.vendorOrdersSeenAt) {
+    // First use: baseline at the newest existing order so historical orders
+    // do not flood the badge. Later orders are counted on the next poll.
+    const latest = await collections
+      .orders()
+      .find({ vendorId })
+      .sort({ createdAt: -1 })
+      .limit(1)
+      .toArray();
+    await collections.users().updateOne(userFilter, {
+      $set: { vendorOrdersSeenAt: latest[0]?.createdAt ?? new Date() },
+    });
+    res.json({ success: true, count: 0 });
+    return;
+  }
+
+  const count = await collections.orders().countDocuments({
+    vendorId,
+    createdAt: { $gt: user.vendorOrdersSeenAt },
+  });
+  res.json({ success: true, count });
+});
+
+export const markVendorOrdersSeen = asyncHandler(async (req: Request, res: Response) => {
+  await collections.users().updateOne(
+    { _id: new ObjectId(req.user!.id) },
+    { $set: { vendorOrdersSeenAt: new Date() } },
+  );
+  res.json({ success: true });
+});
+
 export const getOrder = asyncHandler(async (req: Request, res: Response) => {
   const order = await findOrderForRequest(req);
   const names = await restaurantNamesForOrders([order]);
