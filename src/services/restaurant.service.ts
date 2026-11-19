@@ -1,23 +1,15 @@
 import { ObjectId } from "mongodb";
 
 import { collections } from "../config/database.js";
-import type { UserDoc } from "../types/models.js";
 import { conflict } from "../utils/errors.js";
 import {
   FREE_RESTAURANT_LIMIT,
   isPremiumUser,
+  SUBSCRIPTION_STATE_PROJECTION,
 } from "./subscription.service.js";
 
 export const RESTAURANT_LIMIT_MESSAGE =
   "You have reached the maximum limit of 3 restaurants. Upgrade to Premium to add more restaurants.";
-
-type SubscriptionProjection = Pick<
-  UserDoc,
-  | "subscriptionPlan"
-  | "subscriptionStatus"
-  | "subscriptionExpiresAt"
-  | "cancelAtPeriodEnd"
->;
 
 /**
  * Reserves the next free restaurant slot for a vendor. Premium vendors get
@@ -30,17 +22,10 @@ export const reserveFreeRestaurantSlot = async (
 ): Promise<number | null> => {
   const vendor = await collections.users().findOne(
     { _id: new ObjectId(vendorId) },
-    {
-      projection: {
-        subscriptionPlan: 1,
-        subscriptionStatus: 1,
-        subscriptionExpiresAt: 1,
-        cancelAtPeriodEnd: 1,
-      },
-    },
+    { projection: SUBSCRIPTION_STATE_PROJECTION },
   );
 
-  if (vendor && isPremiumUser(vendor as SubscriptionProjection)) return null;
+  if (vendor && isPremiumUser(vendor)) return null;
 
   const restaurants = await collections
     .restaurants()

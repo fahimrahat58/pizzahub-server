@@ -22,6 +22,17 @@ export const FREE_ITEM_LIMIT = 3;
 /** Free vendors may own at most three restaurants. */
 export const FREE_RESTAURANT_LIMIT = 3;
 
+/** Every field the authoritative Premium calculation needs. */
+export const SUBSCRIPTION_STATE_PROJECTION: Record<string, 1> = {
+  subscriptionPlan: 1,
+  subscriptionStatus: 1,
+  subscriptionExpiresAt: 1,
+  cancelAt: 1,
+  cancelAtPeriodEnd: 1,
+  endedAt: 1,
+  canceledAt: 1,
+};
+
 const ACTIVE_STATUSES: SubscriptionStatus[] = ["active", "trialing"];
 /** Statuses after which Stripe will not resume the same subscription. */
 const TERMINAL_STATUSES: SubscriptionStatus[] = ["canceled", "incomplete_expired"];
@@ -106,6 +117,28 @@ export const getEffectiveSubscription = (
 
 export const isPremiumUser = (user: SubscriptionState): boolean =>
   getEffectiveSubscription(user).isPremium;
+
+/** Resolves currently Premium vendors from trusted MongoDB subscription state. */
+export const getPremiumVendorIds = async (
+  vendorIds: Iterable<string>,
+): Promise<Set<string>> => {
+  const objectIds = [...new Set(vendorIds)]
+    .filter((vendorId) => isValidObjectId(vendorId))
+    .map((vendorId) => new ObjectId(vendorId));
+  if (objectIds.length === 0) return new Set();
+
+  const vendors = await collections
+    .users()
+    .find(
+      { _id: { $in: objectIds } },
+      { projection: SUBSCRIPTION_STATE_PROJECTION },
+    )
+    .toArray();
+
+  return new Set(
+    vendors.filter((vendor) => isPremiumUser(vendor)).map((vendor) => vendor._id.toHexString()),
+  );
+};
 
 export const normalizeStripeStatus = (status: string): SubscriptionStatus => {
   const match = KNOWN_STATUSES.find((value) => value === status);

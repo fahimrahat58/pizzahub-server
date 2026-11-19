@@ -64,6 +64,7 @@ type MenuEnrichment = {
   restaurantInfo?: RestaurantSummarySource[];
   restaurant?: RestaurantSummarySource | null;
   vendorName?: string | null;
+  vendorPremium?: boolean | null;
 };
 
 const emptyRatingDistribution = (): RatingDistribution => ({
@@ -123,7 +124,7 @@ export const menuItemDto = (
     isActive: item.isActive,
     approvalStatus: item.approvalStatus,
     isFeatured: item.isFeatured,
-    vendorPremium: item.vendorPremium ?? false,
+    vendorPremium: enriched.vendorPremium ?? item.vendorPremium ?? false,
     rejectionReason: item.rejectionReason ?? null,
     ratingAvg: enriched.ratingAvg ?? 0,
     reviewCount: enriched.reviewCount ?? 0,
@@ -136,9 +137,11 @@ export const menuItemDto = (
 export const restaurantDto = (
   restaurant: RestaurantDoc,
   rating?: { ratingAvg: number; reviewCount: number },
+  vendorPremium = false,
 ) => ({
   id: id(restaurant),
   vendorId: restaurant.vendorId,
+  vendorPremium,
   name: restaurant.name,
   description: restaurant.description,
   image: restaurant.image,

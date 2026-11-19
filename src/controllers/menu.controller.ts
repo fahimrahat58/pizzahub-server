@@ -197,7 +197,7 @@ export const listPublicMenu = asyncHandler(async (req: Request, res: Response) =
     sort,
     (page - 1) * limit,
     limit,
-    true,
+    { premiumFirst: true },
   );
   const [items, total] = await Promise.all([
     collections.menuItems().aggregate<MenuItemDoc>(pipeline).toArray(),
@@ -555,10 +555,11 @@ export const getFeaturedMenu = asyncHandler(async (_req: Request, res: Response)
     .menuItems()
     .aggregate<MenuItemDoc>(
       menuWithRatingsPipeline(
-        { ...publicFilter(), isFeatured: true },
-        { createdAt: -1 },
+        publicFilter(),
+        { isFeatured: -1, createdAt: -1 },
         0,
         8,
+        { featuredPlacement: true, premiumFirst: true },
       ),
     )
     .toArray();

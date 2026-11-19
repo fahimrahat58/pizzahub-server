@@ -7,6 +7,7 @@ import {
   RESTAURANT_LIMIT_MESSAGE,
   reserveFreeRestaurantSlot,
 } from "../services/restaurant.service.js";
+import { getPremiumVendorIds } from "../services/subscription.service.js";
 import {
   asyncHandler,
   badRequest,
@@ -81,13 +82,28 @@ export const listRestaurants = asyncHandler(async (_req: Request, res: Response)
   const restaurants = await collections
     .restaurants()
     .find({})
-    .sort({ createdAt: -1 })
     .toArray();
-  const ratings = await ratingsForRestaurants(restaurants);
+  const [ratings, premiumVendorIds] = await Promise.all([
+    ratingsForRestaurants(restaurants),
+    getPremiumVendorIds(restaurants.map((restaurant) => restaurant.vendorId)),
+  ]);
+  // Verified Premium kitchens receive the featured slot in the public list.
+  // Ties keep the existing newest-first order and an id tie stays deterministic.
+  restaurants.sort(
+    (a, b) =>
+      Number(premiumVendorIds.has(b.vendorId)) -
+        Number(premiumVendorIds.has(a.vendorId)) ||
+      b.createdAt.getTime() - a.createdAt.getTime() ||
+      a._id.toHexString().localeCompare(b._id.toHexString()),
+  );
   res.json({
     success: true,
     restaurants: restaurants.map((restaurant) =>
-      restaurantDto(restaurant, ratings.get(restaurant._id.toHexString())),
+      restaurantDto(
+        restaurant,
+        ratings.get(restaurant._id.toHexString()),
+        premiumVendorIds.has(restaurant.vendorId),
+      ),
     ),
   });
 });
@@ -98,10 +114,17 @@ export const getRestaurant = asyncHandler(async (req: Request, res: Response) =>
     .restaurants()
     .findOne({ _id: new ObjectId(String(req.params.id)) });
   if (!restaurant) throw notFound("Restaurant not found");
-  const ratings = await ratingsForRestaurants([restaurant]);
+  const [ratings, premiumVendorIds] = await Promise.all([
+    ratingsForRestaurants([restaurant]),
+    getPremiumVendorIds([restaurant.vendorId]),
+  ]);
   res.json({
     success: true,
-    restaurant: restaurantDto(restaurant, ratings.get(restaurant._id.toHexString())),
+    restaurant: restaurantDto(
+      restaurant,
+      ratings.get(restaurant._id.toHexString()),
+      premiumVendorIds.has(restaurant.vendorId),
+    ),
   });
 });
 
@@ -112,9 +135,16 @@ export const listMyRestaurants = asyncHandler(
       .find({ vendorId: req.user!.id })
       .sort({ createdAt: 1 })
       .toArray();
-    const ratings = await ratingsForRestaurants(restaurants);
+    const [ratings, premiumVendorIds] = await Promise.all([
+      ratingsForRestaurants(restaurants),
+      getPremiumVendorIds([req.user!.id]),
+    ]);
     const withRatings = restaurants.map((restaurant) =>
-      restaurantDto(restaurant, ratings.get(restaurant._id.toHexString())),
+      restaurantDto(
+        restaurant,
+        ratings.get(restaurant._id.toHexString()),
+        premiumVendorIds.has(req.user!.id),
+      ),
     );
     res.json({
       success: true,

@@ -15,6 +15,7 @@ import favoriteRoutes from "./routes/favorites.routes.js";
 import reviewRoutes from "./routes/reviews.routes.js";
 import recommendationRoutes from "./routes/recommendations.routes.js";
 import adminRoutes from "./routes/admin.routes.js";
+import dashboardRoutes from "./routes/dashboard.routes.js";
 import uploadRoutes from "./routes/uploads.routes.js";
 import subscriptionRoutes from "./routes/subscriptions.routes.js";
 import webhookRoutes from "./routes/webhooks.routes.js";
@@ -66,6 +67,7 @@ app.use("/api/favorites", favoriteRoutes);
 app.use("/api/reviews", reviewRoutes);
 app.use("/api/recommendations", recommendationRoutes);
 app.use("/api/admin", adminRoutes);
+app.use("/api/dashboard", dashboardRoutes);
 app.use("/api/uploads", uploadRoutes);
 app.use("/api/subscriptions", subscriptionRoutes);
 

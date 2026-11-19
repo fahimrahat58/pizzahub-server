@@ -4,6 +4,7 @@ import { collections } from "../config/database.js";
 import {
   FREE_ITEM_LIMIT,
   isPremiumUser,
+  SUBSCRIPTION_STATE_PROJECTION,
 } from "./subscription.service.js";
 
 export { FREE_ITEM_LIMIT };
@@ -15,14 +16,7 @@ export const canActivateMenuItem = async (
 ): Promise<boolean> => {
   const vendor = await collections.users().findOne(
     { _id: new ObjectId(vendorId) },
-    {
-      projection: {
-        subscriptionPlan: 1,
-        subscriptionStatus: 1,
-        subscriptionExpiresAt: 1,
-        cancelAtPeriodEnd: 1,
-      },
-    },
+    { projection: SUBSCRIPTION_STATE_PROJECTION },
   );
 
   // Premium is computed from trusted MongoDB subscription state. Inactive or
@@ -72,6 +66,8 @@ const vendorLookup = {
           subscriptionPlan: 1,
           subscriptionStatus: 1,
           subscriptionExpiresAt: 1,
+          endedAt: 1,
+          canceledAt: 1,
         },
       },
     ],
@@ -87,6 +83,9 @@ const vendorFields = {
         in: "$$vendor.name",
       },
     },
+    // Mirrors getEffectiveSubscription() from the same trusted MongoDB fields:
+    // premium/pro plan, active or trialing status (legacy no-status plans
+    // count as active), not expired, and not ended.
     vendorPremium: {
       $let: {
         vars: { vendor: { $arrayElemAt: ["$vendorInfo", 0] } },
@@ -110,6 +109,7 @@ const vendorFields = {
                 { $gt: ["$$vendor.subscriptionExpiresAt", "$$NOW"] },
               ],
             },
+            { $eq: [{ $ifNull: ["$$vendor.endedAt", null] }, null] },
           ],
         },
       },
@@ -205,21 +205,48 @@ export const restaurantLookup = {
   },
 };
 
+export type MenuPipelineOptions = {
+  /** Prioritises verified Premium vendors while preserving the chosen sort. */
+  premiumFirst?: boolean;
+  /** Includes Premium items in the existing featured placement listing. */
+  featuredPlacement?: boolean;
+};
+
 export const menuWithRatingsPipeline = (
   match: Document,
   sort: Document,
   skip: number,
   limit: number,
-  _premiumFirst = false,
-): Document[] => [
-  { $match: match },
-  vendorLookup,
-  ratingLookup,
-  ratingFields,
-  restaurantLookup,
-  vendorFields,
-  { $project: { ratingInfo: 0, vendorInfo: 0 } },
-  ...(Object.keys(sort).length > 0 ? [{ $sort: sort }] : []),
-  { $skip: skip },
-  { $limit: limit },
-];
+  options: MenuPipelineOptions = {},
+): Document[] => {
+  const { premiumFirst = false, featuredPlacement = false } = options;
+  const sortStages = Object.keys(sort).length
+    ? [
+        {
+          $sort: premiumFirst
+            ? { _premiumPlacement: -1, ...sort, _id: 1 }
+            : { ...sort, _id: 1 },
+        },
+      ]
+    : [];
+
+  return [
+    { $match: match },
+    vendorLookup,
+    ratingLookup,
+    ratingFields,
+    restaurantLookup,
+    vendorFields,
+    { $project: { ratingInfo: 0, vendorInfo: 0 } },
+    ...(featuredPlacement
+      ? [{ $match: { $or: [{ isFeatured: true }, { vendorPremium: true }] } }]
+      : []),
+    ...(premiumFirst
+      ? [{ $addFields: { _premiumPlacement: { $cond: ["$vendorPremium", 1, 0] } } }]
+      : []),
+    ...sortStages,
+    ...(premiumFirst ? [{ $project: { _premiumPlacement: 0 } }] : []),
+    { $skip: skip },
+    { $limit: limit },
+  ];
+};
