@@ -41,7 +41,11 @@ const userIdFilter = (id: string): { _id: ObjectId } => {
 const isImgBbUrl = (value: string): boolean => {
   try {
     const host = new URL(value).hostname.toLowerCase();
-    return host === "i.imgbb.com" || host.endsWith(".imgbb.com");
+    // ImgBB serves uploaded images from i.ibb.co, while older records may use
+    // imgbb.com. Accept either CDN and its subdomains, but not lookalike hosts.
+    return ["imgbb.com", "ibb.co"].some(
+      (domain) => host === domain || host.endsWith(`.${domain}`),
+    );
   } catch {
     return false;
   }
