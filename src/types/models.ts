@@ -118,6 +118,7 @@ export interface TransactionDoc {
   currency: string;
   status: SubscriptionStatus;
   stripeEventId: string;
+  stripeInvoiceId?: string | null;
   stripeSubscriptionId?: string | null;
   description?: string | null;
   createdAt: Date;

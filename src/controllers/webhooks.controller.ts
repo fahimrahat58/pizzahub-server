@@ -83,6 +83,10 @@ const applyEvent = async (event: Stripe.Event): Promise<void> => {
   let amount: number | null = null;
   let currency = "usd";
   let paymentSubscriptionId: string | null = null;
+  let paymentInvoiceId: string | null = null;
+  // Subscription checkouts are recorded when their first invoice is paid.
+  // Recording the checkout event too would create a second row for one payment.
+  let skipCheckoutTransaction = false;
 
   switch (event.type) {
     case "checkout.session.expired": {
@@ -105,6 +109,7 @@ const applyEvent = async (event: Stripe.Event): Promise<void> => {
 
     case "checkout.session.completed": {
       const session = event.data.object;
+      skipCheckoutTransaction = Boolean(idOf(session.subscription));
       description = "Checkout completed";
       amount = (session.amount_total ?? 0) / 100;
       currency = session.currency ?? "usd";
@@ -210,6 +215,9 @@ const applyEvent = async (event: Stripe.Event): Promise<void> => {
       amount = ((succeeded ? invoice.amount_paid : invoice.amount_due) ?? 0) / 100;
       currency = invoice.currency ?? "usd";
       status = succeeded ? "active" : "past_due";
+      // Failed attempts remain keyed by event id so a later successful retry
+      // can still be recorded as a separate payment attempt.
+      paymentInvoiceId = succeeded ? invoice.id : null;
 
       const parentSubscription =
         invoice.parent?.subscription_details?.subscription ?? null;
@@ -254,7 +262,7 @@ const applyEvent = async (event: Stripe.Event): Promise<void> => {
 
   // Only payment events produce a transaction record; subscription lifecycle
   // events without an amount are tracked in subscriptionEvents above.
-  if (vendorId && amount !== null && status) {
+  if (vendorId && amount !== null && status && !skipCheckoutTransaction) {
     await recordTransaction({
       eventId,
       vendorId,
@@ -264,6 +272,7 @@ const applyEvent = async (event: Stripe.Event): Promise<void> => {
       currency,
       status,
       subscriptionId: paymentSubscriptionId,
+      invoiceId: paymentInvoiceId,
       description,
     });
   }

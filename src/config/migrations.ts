@@ -1,7 +1,7 @@
 import { ObjectId } from "mongodb";
 
 import { collections } from "./database.js";
-import type { MenuItemDoc } from "../types/models.js";
+import type { MenuItemDoc, TransactionDoc } from "../types/models.js";
 
 /**
  * Brings legacy menu data in line with the current rules:
@@ -101,4 +101,67 @@ export const migrateMenuPublishing = async (): Promise<void> => {
       collections.menuItems().deleteOne({ _id: itemId }),
     ]);
   }
+};
+
+const CHECKOUT_INVOICE_MATCH_WINDOW_MS = 60_000;
+const CHECKOUT_DESCRIPTION = "Checkout completed";
+const PAID_INVOICE_DESCRIPTION = "Renewal payment succeeded";
+
+/**
+ * Older webhook releases stored both the checkout event and the first paid
+ * invoice for one subscription payment. Keep the invoice row (the authoritative
+ * payment record) and remove only the paired rows created within a short
+ * window. Separate renewals and failed attempts are never merged.
+ */
+export const migrateDuplicateTransactions = async (): Promise<void> => {
+  const rows = await collections
+    .transactions()
+    .find({ stripeSubscriptionId: { $exists: true, $ne: null } })
+    .sort({ createdAt: 1 })
+    .toArray();
+
+  const groups = new Map<string, TransactionDoc[]>();
+  for (const row of rows) {
+    if (!row.stripeSubscriptionId) continue;
+    const key = [
+      row.vendorId,
+      row.stripeSubscriptionId,
+      row.currency,
+      row.amount,
+    ].join("|");
+    const group = groups.get(key) ?? [];
+    group.push(row);
+    groups.set(key, group);
+  }
+
+  const duplicateIds = new Set<string>();
+  for (const group of groups.values()) {
+    const checkouts = group.filter(
+      (row) => row.description === CHECKOUT_DESCRIPTION,
+    );
+    for (const checkout of checkouts) {
+      const cluster = group.filter(
+        (row) =>
+          Math.abs(row.createdAt.getTime() - checkout.createdAt.getTime()) <=
+            CHECKOUT_INVOICE_MATCH_WINDOW_MS &&
+          (row.description === CHECKOUT_DESCRIPTION ||
+            row.description === PAID_INVOICE_DESCRIPTION),
+      );
+      const paidInvoices = cluster.filter(
+        (row) => row.description === PAID_INVOICE_DESCRIPTION,
+      );
+      if (paidInvoices.length === 0) continue;
+
+      const keep = paidInvoices[paidInvoices.length - 1];
+      for (const row of cluster) {
+        if (!row._id.equals(keep._id)) duplicateIds.add(row._id.toHexString());
+      }
+    }
+  }
+
+  if (duplicateIds.size === 0) return;
+
+  await collections.transactions().deleteMany({
+    _id: { $in: [...duplicateIds].map((id) => new ObjectId(id)) },
+  });
 };

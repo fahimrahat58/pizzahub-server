@@ -2,7 +2,7 @@ import cors from "cors";
 import express from "express";
 
 import { initializeRuntime } from "./config/bootstrap.js";
-import { env } from "./config/env.js";
+import { corsOrigins, env } from "./config/env.js";
 import { errorHandler } from "./utils/errors.js";
 
 import testRoutes from "./routes/test.routes.js";
@@ -21,6 +21,17 @@ import webhookRoutes from "./routes/webhooks.routes.js";
 
 const app = express();
 
+// CORS must be the first middleware so preflights and even initialization or
+// body-parser errors still carry the correct headers. Only exact allowlisted
+// origins are reflected; credentials remain enabled for Better Auth cookies.
+app.use(
+  cors({
+    origin: corsOrigins,
+    credentials: true,
+    optionsSuccessStatus: 204,
+  }),
+);
+
 // Every request waits for the shared MongoDB/index/migration initialization.
 // This is a no-op after the first successful invocation.
 app.use(async (_req, _res, next) => {
@@ -31,13 +42,6 @@ app.use(async (_req, _res, next) => {
     next(error);
   }
 });
-
-app.use(
-  cors({
-    origin: env.frontendUrl.split(",").map((origin) => origin.trim()),
-    credentials: true,
-  }),
-);
 // Stripe calls POST /api/stripe/webhook. The router is mounted BEFORE
 // express.json() so signature verification receives the untouched raw bytes.
 app.use("/api/stripe", webhookRoutes);

@@ -725,6 +725,7 @@ export const recordTransaction = async (input: {
   currency: string;
   status: SubscriptionStatus;
   subscriptionId?: string | null;
+  invoiceId?: string | null;
   description?: string | null;
 }): Promise<void> => {
   const vendor = await collections
@@ -742,18 +743,25 @@ export const recordTransaction = async (input: {
     currency: input.currency.toUpperCase(),
     status: input.status,
     stripeEventId: input.eventId,
+    ...(input.invoiceId ? { stripeInvoiceId: input.invoiceId } : {}),
     billingInterval: input.billingInterval ?? null,
     stripeSubscriptionId: input.subscriptionId ?? null,
     description: input.description ?? null,
     createdAt: new Date(),
   };
 
-  // Idempotent by event id: a retried webhook never creates a duplicate.
-  await collections
-    .transactions()
-    .updateOne(
-      { stripeEventId: input.eventId },
-      { $setOnInsert: document },
-      { upsert: true },
-    );
+  // Stripe event ids protect against retries. Invoice ids additionally collapse
+  // the initial checkout and its invoice events into one genuine payment.
+  const filter = input.invoiceId
+    ? { stripeInvoiceId: input.invoiceId }
+    : { stripeEventId: input.eventId };
+
+  try {
+    await collections
+      .transactions()
+      .updateOne(filter, { $setOnInsert: document }, { upsert: true });
+  } catch (error) {
+    if (error instanceof MongoServerError && error.code === 11000) return;
+    throw error;
+  }
 };

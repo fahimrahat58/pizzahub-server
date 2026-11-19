@@ -231,6 +231,18 @@ export const createIndexes = async (): Promise<void> => {
           .transactions()
           .createIndex({ stripeEventId: 1 }, { unique: true }),
     },
+    {
+      // One Stripe invoice is one payment even when several event types refer
+      // to it. Sparse so older one-off records without an invoice remain valid.
+      name: "transactions.stripeInvoice",
+      run: () =>
+        collections
+          .transactions()
+          .createIndex(
+            { stripeInvoiceId: 1 },
+            { unique: true, sparse: true },
+          ),
+    },
   ];
 
   await Promise.allSettled(

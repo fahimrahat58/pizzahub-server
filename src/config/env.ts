@@ -11,6 +11,26 @@ const required = (name: string): string => {
 const optional = (name: string, fallback: string): string =>
   process.env[name]?.trim() ? (process.env[name] as string) : fallback;
 
+const normalizeOrigin = (origin: string): string => origin.trim().replace(/\/$/, "");
+
+/**
+ * CORS never depends on a single deployment environment variable. The exact
+ * production frontend and local development origin are always allowed, and
+ * FRONTEND_URL may add other explicitly configured origins.
+ */
+const configuredFrontendOrigins = optional("FRONTEND_URL", "http://localhost:3000")
+  .split(",")
+  .map(normalizeOrigin)
+  .filter(Boolean);
+
+export const corsOrigins: string[] = Array.from(
+  new Set([
+    "https://pizzahub-mocha.vercel.app",
+    "http://localhost:3000",
+    ...configuredFrontendOrigins,
+  ]),
+);
+
 /**
  * Stripe values are deliberately optional at startup so the rest of PizzaHub
  * keeps running when billing is not configured. Endpoints that need Stripe
