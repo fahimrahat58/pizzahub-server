@@ -188,7 +188,9 @@ export const listPublicMenu = asyncHandler(async (req: Request, res: Response) =
         ? { price: -1 }
         : sortBy === "rating"
           ? { ratingAvg: -1, createdAt: -1 }
-          : { vendorPremium: -1, createdAt: -1 };
+          : sortBy === "oldest"
+            ? { createdAt: 1 }
+            : { createdAt: -1 };
 
   const pipeline = menuWithRatingsPipeline(
     filter,
