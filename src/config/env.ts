@@ -53,6 +53,17 @@ const isPlaceholder = (value: string): boolean =>
   value === "change-me" ||
   value === "sk_test_replace_me";
 
+const isStripeWebhookSecret = (value: string): boolean => {
+  const normalized = value.toLowerCase();
+  return (
+    normalized.startsWith("whsec_") &&
+    normalized.length > "whsec_".length + 8 &&
+    !normalized.includes("replace_me") &&
+    !normalized.includes("change_me") &&
+    !normalized.includes("your_webhook_secret")
+  );
+};
+
 export const env = {
   port: Number(optional("PORT", "5000")),
   frontendUrl: optional("FRONTEND_URL", "http://localhost:3000"),
@@ -97,7 +108,7 @@ export const getDevelopmentEmailRecipient = (): string | null => {
 /** True only when all four Stripe values are present and non-placeholder. */
 export const isStripeConfigured = (): boolean =>
   !isPlaceholder(env.stripeSecretKey) &&
-  !isPlaceholder(env.stripeWebhookSecret) &&
+  isStripeWebhookSecret(env.stripeWebhookSecret) &&
   !isPlaceholder(env.stripePriceIdMonthly) &&
   !isPlaceholder(env.stripePriceIdYearly) &&
   env.stripePriceIdMonthly.startsWith("price_") &&
@@ -111,6 +122,9 @@ export const stripeConfigIssue = (): string | null => {
   if (isStripeConfigured()) return null;
   if (!env.stripeSecretKey) return "STRIPE_SECRET_KEY is not configured";
   if (!env.stripeWebhookSecret) return "STRIPE_WEBHOOK_SECRET is not configured";
+  if (!isStripeWebhookSecret(env.stripeWebhookSecret)) {
+    return "STRIPE_WEBHOOK_SECRET must be a valid Stripe webhook signing secret";
+  }
   if (!env.stripePriceIdMonthly.startsWith("price_")) {
     return "STRIPE_PRICE_ID_MONTHLY must be a Stripe Price ID (price_...), not a Product ID";
   }

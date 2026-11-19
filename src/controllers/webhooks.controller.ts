@@ -104,7 +104,8 @@ const applyEvent = async (event: Stripe.Event): Promise<void> => {
           customerId: idOf(session.customer),
         });
       }
-      return;
+      // Successful no-op; the caller completes the claimed event.
+      break;
     }
 
     case "checkout.session.completed": {
@@ -245,7 +246,8 @@ const applyEvent = async (event: Stripe.Event): Promise<void> => {
         eventId,
         eventType: event.type,
       });
-      return;
+      // Successful no-op; the caller completes the claimed event.
+      break;
   }
 
   if (vendorId) {

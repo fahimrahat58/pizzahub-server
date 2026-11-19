@@ -202,6 +202,15 @@ const expireCheckout = async (sessionId, vendorId, customerId) => {
     },
   });
   assert.equal(result.response.status, 200, JSON.stringify(result.data));
+  const storedEvent = await client
+    .db(process.env.DB_NAME)
+    .collection("stripeEvents")
+    .findOne({ _id: eventId });
+  assert.equal(
+    storedEvent?.status,
+    "processed",
+    "expired Stripe events must reach a terminal state",
+  );
 };
 
 const subscriptionEvent = (
@@ -2053,6 +2062,22 @@ try {
   await api("admin", "PATCH", `/api/users/admin/${vendor.id}/role`, { role: "customer" });
   await api("admin", "PATCH", `/api/users/admin/${vendor.id}/role`, { role: "vendor" });
   pass("Admin can search users and change roles");
+
+  for (const path of ["/api/users/admin", "/api/users/admin/subscriptions"]) {
+    const regexSearch = await api(
+      "admin",
+      "GET",
+      `${path}?search=${encodeURIComponent(".*")}`,
+    );
+    assert.equal(regexSearch.pagination.total, 0);
+    const longSearch = await api(
+      "admin",
+      "GET",
+      `${path}?search=${encodeURIComponent("a".repeat(500))}`,
+    );
+    assert.equal(longSearch.pagination.total, 0);
+  }
+  pass("Admin search escapes regex metacharacters and caps search length");
 
   await api(
     "admin",

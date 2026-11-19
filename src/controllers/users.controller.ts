@@ -18,6 +18,14 @@ import {
 import { userDto } from "../utils/serialize.js";
 import type { UserDoc } from "../types/models.js";
 
+const MAX_ADMIN_SEARCH_LENGTH = 100;
+
+const adminSearchPattern = (value: string | undefined): string =>
+  (value ?? "")
+    .trim()
+    .slice(0, MAX_ADMIN_SEARCH_LENGTH)
+    .replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
 export const updateMeSchema = z
   .object({
     name: z.string().trim().min(2).max(80).optional(),
@@ -100,7 +108,7 @@ export const updateProfileImage = asyncHandler(
 
 export const adminListUsers = asyncHandler(async (req: Request, res: Response) => {
   const { page, limit } = getPagination(req);
-  const search = firstString(req.query.search)?.trim() ?? "";
+  const search = adminSearchPattern(firstString(req.query.search));
   const role = firstString(req.query.role);
 
   const filter = {
@@ -347,7 +355,7 @@ export const adminDeleteUser = asyncHandler(
 export const adminListSubscriptions = asyncHandler(
   async (req: Request, res: Response) => {
     const { page, limit } = getPagination(req);
-    const search = firstString(req.query.search)?.trim() ?? "";
+    const search = adminSearchPattern(firstString(req.query.search));
     const filter: Document = { role: "vendor" };
     if (search) {
       filter.$or = [

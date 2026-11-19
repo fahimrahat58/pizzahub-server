@@ -1,5 +1,5 @@
 import type { NextFunction, Request, Response } from "express";
-import { createRemoteJWKSet, jwtVerify } from "jose";
+import { createRemoteJWKSet, errors, jwtVerify, type JWTPayload } from "jose";
 import { ObjectId } from "mongodb";
 
 import { collections } from "../config/database.js";
@@ -8,6 +8,38 @@ import type { UserRole } from "../types/models.js";
 import { isValidObjectId } from "../utils/query.js";
 
 const JWKS = createRemoteJWKSet(new URL(`${env.authUrl}/api/auth/jwks`));
+
+const AUTH_UNAVAILABLE_MESSAGE = "Authentication is temporarily unavailable";
+
+const isJwtValidationError = (error: unknown): boolean =>
+  error instanceof errors.JWTExpired ||
+  error instanceof errors.JWTClaimValidationFailed ||
+  error instanceof errors.JOSEAlgNotAllowed ||
+  error instanceof errors.JWSInvalid ||
+  error instanceof errors.JWTInvalid ||
+  error instanceof errors.JWSSignatureVerificationFailed ||
+  error instanceof errors.JWKSNoMatchingKey;
+
+const respondWithAuthUnavailable = (
+  res: Response,
+  context: string,
+  error: unknown,
+): void => {
+  console.error(
+    context,
+    error instanceof Error
+      ? {
+          name: error.name,
+          message: error.message,
+          ...("code" in error ? { code: String(error.code) } : {}),
+        }
+      : { name: "UnknownError" },
+  );
+  res.status(503).json({
+    success: false,
+    message: AUTH_UNAVAILABLE_MESSAGE,
+  });
+};
 
 /**
  * Verifies the Better Auth JWT (signature, exp, iss, aud), confirms the
@@ -20,6 +52,8 @@ export const verifyToken = async (
   res: Response,
   next: NextFunction,
 ): Promise<void> => {
+  let payload: JWTPayload;
+
   try {
     const authorization = req.headers.authorization;
     if (!authorization?.startsWith("Bearer ")) {
@@ -37,14 +71,26 @@ export const verifyToken = async (
       return;
     }
 
-    const { payload } = await jwtVerify(token, JWKS, {
+    ({ payload } = await jwtVerify(token, JWKS, {
       issuer: env.authUrl,
       audience: env.authUrl,
       // Better Auth's default JWKS keyPairConfig is EdDSA / Ed25519 and this
       // app does not override jwks.keyPairConfig or jwt.sign.
       algorithms: ["EdDSA"],
-    });
+    }));
+  } catch (error) {
+    if (isJwtValidationError(error)) {
+      res.status(401).json({
+        success: false,
+        message: "Invalid or expired authentication token",
+      });
+      return;
+    }
+    respondWithAuthUnavailable(res, "JWT verification dependency failure", error);
+    return;
+  }
 
+  try {
     const userId = payload.sub;
     if (!userId || !isValidObjectId(userId)) {
       res
@@ -121,12 +167,7 @@ export const verifyToken = async (
     };
     next();
   } catch (error) {
-    // A missing/expired JWT or unreachable JWKS is an authentication failure.
-    void error;
-    res.status(401).json({
-      success: false,
-      message: "Invalid or expired authentication token",
-    });
+    respondWithAuthUnavailable(res, "Authentication dependency failure", error);
   }
 };
 

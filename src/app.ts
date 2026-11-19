@@ -57,7 +57,9 @@ app.get("/api/health", (_req, res) => {
   res.json({ success: true, message: "Server is healthy" });
 });
 
-app.use("/api/test", testRoutes);
+if (env.nodeEnv !== "production") {
+  app.use("/api/test", testRoutes);
+}
 app.use("/api/auth", authRoutes);
 app.use("/api/users", userRoutes);
 app.use("/api/restaurants", restaurantRoutes);
