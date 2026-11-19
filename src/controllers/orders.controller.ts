@@ -128,6 +128,7 @@ export const createOrder = asyncHandler(async (req: Request, res: Response) => {
     deliveryDate: data.deliveryDate,
     message: data.message,
     status: "pending",
+    vendorSeen: false,
     timeline: [entry("pending", "customer", "Order placed")],
     activeOrderKey: `${req.user!.id}:${item._id.toHexString()}:${data.deliveryDate}`,
     customerSnapshot: {
@@ -281,26 +282,27 @@ export const listAllOrders = asyncHandler((req: Request, res: Response) =>
 );
 
 /**
- * New-order badge for the vendor dashboard. The seen marker lives on the
- * vendor's own user document, so counting is scoped to their orders and a
- * refresh/page reload cannot lose the state.
+ * New-order badge for the vendor dashboard. Seen state is stored per order,
+ * not as a wall-clock timestamp on the vendor, so an order created on another
+ * server instance (or while the Orders page is opening) cannot be swallowed
+ * by clock skew or an in-flight request. The legacy timestamp is kept on the
+ * user document for compatibility but is no longer used for counting.
  */
 export const getVendorUnseenOrderCount = asyncHandler(async (req: Request, res: Response) => {
   const vendorId = req.user!.id;
   const userFilter = { _id: new ObjectId(vendorId) };
   const user = await collections.users().findOne(userFilter);
 
-  if (!user?.vendorOrdersSeenAt) {
-    // First use: baseline at the newest existing order so historical orders
-    // do not flood the badge. Later orders are counted on the next poll.
-    const latest = await collections
-      .orders()
-      .find({ vendorId })
-      .sort({ createdAt: -1 })
-      .limit(1)
-      .toArray();
+  if (!user?.vendorBadgeInitialized) {
+    // First use (or upgrade from the legacy timestamp): existing orders are
+    // already known to the vendor, so baseline them instead of flooding the
+    // badge. Orders inserted after this point are unseen by default.
+    await collections.orders().updateMany(
+      { vendorId },
+      { $set: { vendorSeen: true } },
+    );
     await collections.users().updateOne(userFilter, {
-      $set: { vendorOrdersSeenAt: latest[0]?.createdAt ?? new Date() },
+      $set: { vendorBadgeInitialized: true },
     });
     res.json({ success: true, count: 0 });
     return;
@@ -308,17 +310,30 @@ export const getVendorUnseenOrderCount = asyncHandler(async (req: Request, res: 
 
   const count = await collections.orders().countDocuments({
     vendorId,
-    createdAt: { $gt: user.vendorOrdersSeenAt },
+    vendorSeen: { $ne: true },
   });
   res.json({ success: true, count });
 });
 
 export const markVendorOrdersSeen = asyncHandler(async (req: Request, res: Response) => {
-  await collections.users().updateOne(
-    { _id: new ObjectId(req.user!.id) },
-    { $set: { vendorOrdersSeenAt: new Date() } },
-  );
-  res.json({ success: true });
+  const vendorId = req.user!.id;
+  await Promise.all([
+    collections.orders().updateMany(
+      { vendorId, vendorSeen: { $ne: true } },
+      { $set: { vendorSeen: true } },
+    ),
+    collections.users().updateOne(
+      { _id: new ObjectId(vendorId) },
+      { $set: { vendorBadgeInitialized: true } },
+    ),
+  ]);
+  // Return what is still unseen so an order inserted while this request was
+  // running is not briefly hidden by the client's immediate "0" update.
+  const count = await collections.orders().countDocuments({
+    vendorId,
+    vendorSeen: { $ne: true },
+  });
+  res.json({ success: true, count });
 });
 
 export const getOrder = asyncHandler(async (req: Request, res: Response) => {

@@ -63,8 +63,10 @@ export interface UserDoc {
   /** Event timestamp/ID of the last accepted subscription state change. */
   subscriptionEventCreatedAt?: Date | null;
   subscriptionEventId?: string | null;
-  /** Orders created after this point are unseen by this vendor. */
+  /** Legacy timestamp from the original badge implementation; no longer used for counting. */
   vendorOrdersSeenAt?: Date | null;
+  /** True once the current per-order badge state has been initialized for this vendor. */
+  vendorBadgeInitialized?: boolean;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -207,6 +209,8 @@ export interface OrderDoc {
   deliveryDate: string;
   message?: string | null;
   status: OrderStatus;
+  /** Badge state for the owning vendor; absent on legacy orders means unseen. */
+  vendorSeen?: boolean;
   timeline: TimelineEntry[];
   /** Present only while the order is active. Enforces one active order per item/date. */
   activeOrderKey?: string;
