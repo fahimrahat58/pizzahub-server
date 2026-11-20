@@ -3,12 +3,16 @@ import { Router } from "express";
 import {
   dashboardStats,
   deleteReview,
+  getTransaction,
   listReviews,
   listTransactions,
+  refundSchema,
+  refundTransaction,
   setReviewHidden,
 } from "../controllers/admin.controller.js";
 import { requireRole, verifyToken } from "../middleware/auth.middleware.js";
 import {
+  validateBody,
   validateParams,
   objectIdParamSchema,
 } from "../middleware/validate.js";
@@ -19,6 +23,17 @@ router.use(verifyToken, requireRole("admin"));
 
 router.get("/stats", dashboardStats);
 router.get("/transactions", listTransactions);
+router.get(
+  "/transactions/:id",
+  validateParams(objectIdParamSchema),
+  getTransaction,
+);
+router.post(
+  "/transactions/:id/refund",
+  validateParams(objectIdParamSchema),
+  validateBody(refundSchema),
+  refundTransaction,
+);
 router.get("/reviews", listReviews);
 router.patch(
   "/reviews/:id/hide",

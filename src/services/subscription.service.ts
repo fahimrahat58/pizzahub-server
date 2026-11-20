@@ -8,6 +8,7 @@ import type {
   BillingInterval,
   CheckoutLockDoc,
   BillingPlanId,
+  PaymentStatus,
   StoredSubscriptionPlan,
   SubscriptionEventDoc,
   SubscriptionPlan,
@@ -623,7 +624,11 @@ export const syncCheckoutSession = async (
   return updated ?? null;
 };
 
-export type StripeEventClaim = "new" | "duplicate";
+export type StripeEventClaim = "new" | "duplicate" | "processing";
+
+// Long enough for a slow in-flight webhook, short enough that a crashed worker
+// cannot block Stripe's retries indefinitely.
+const STRIPE_EVENT_CLAIM_TTL_MS = 60_000;
 
 /** Claims an event id so duplicate webhook deliveries are safe to ignore. */
 export const claimStripeEvent = async (
@@ -631,33 +636,56 @@ export const claimStripeEvent = async (
   type: string,
   vendorId?: string | null,
 ): Promise<StripeEventClaim> => {
+  const now = new Date();
   try {
     await collections.stripeEvents().insertOne({
       _id: eventId,
       type,
       vendorId: vendorId ?? null,
       status: "processing",
-      createdAt: new Date(),
+      createdAt: now,
     });
     return "new";
   } catch (error) {
-    if (error instanceof MongoServerError && error.code === 11000) {
-      return "duplicate";
+    if (!(error instanceof MongoServerError) || error.code !== 11000) throw error;
+
+    const existing = await collections.stripeEvents().findOne(
+      { _id: eventId },
+      { projection: { status: 1, createdAt: 1 } },
+    );
+    if (!existing || existing.status === "processed") return "duplicate";
+
+    if (existing.status === "processing") {
+      const cutoff = new Date(now.getTime() - STRIPE_EVENT_CLAIM_TTL_MS);
+      const reclaimed = await collections.stripeEvents().findOneAndUpdate(
+        { _id: eventId, status: "processing", createdAt: { $lt: cutoff } },
+        {
+          $set: {
+            type,
+            vendorId: vendorId ?? null,
+            status: "processing",
+            createdAt: now,
+          },
+        },
+        { returnDocument: "after" },
+      );
+      if (reclaimed) return "new";
     }
-    throw error;
+    return "processing";
   }
 };
 
 export const completeStripeEvent = async (eventId: string): Promise<void> => {
   await collections.stripeEvents().updateOne(
-    { _id: eventId },
+    { _id: eventId, status: "processing" },
     { $set: { status: "processed", processedAt: new Date() } },
   );
 };
 
 /** Releases a claim on failure so Stripe can retry the webhook. */
 export const releaseStripeEvent = async (eventId: string): Promise<void> => {
-  await collections.stripeEvents().deleteOne({ _id: eventId });
+  // Never erase a row another delivery has already marked processed.
+  await collections.stripeEvents().deleteOne({ _id: eventId, status: "processing" });
 };
 
 // Long enough to cover an in-flight API call, short enough that an abandoned
@@ -766,8 +794,16 @@ export const recordTransaction = async (input: {
     .findOne({ _id: new ObjectId(input.vendorId) });
   if (!vendor) return;
 
+  const paymentStatus: PaymentStatus =
+    input.status === "active" || input.status === "trialing"
+      ? "paid"
+      : input.status === "incomplete"
+        ? "pending"
+        : "failed";
+
   const document: TransactionDoc = {
     _id: new ObjectId(),
+    paymentType: "vendor_subscription",
     vendorId: input.vendorId,
     vendorName: vendor.name,
     vendorEmail: vendor.email,
@@ -775,12 +811,15 @@ export const recordTransaction = async (input: {
     amount: input.amount,
     currency: input.currency.toUpperCase(),
     status: input.status,
+    paymentStatus,
+    paymentMethod: "stripe",
     stripeEventId: input.eventId,
     ...(input.invoiceId ? { stripeInvoiceId: input.invoiceId } : {}),
     billingInterval: input.billingInterval ?? null,
     stripeSubscriptionId: input.subscriptionId ?? null,
     description: input.description ?? null,
     createdAt: new Date(),
+    updatedAt: new Date(),
   };
 
   // Stripe event ids protect against retries. Invoice ids additionally collapse

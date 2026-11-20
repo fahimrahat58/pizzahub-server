@@ -105,6 +105,14 @@ export const getDevelopmentEmailRecipient = (): string | null => {
   return env.resendTestEmail;
 };
 
+/**
+ * Customer one-time payments need only the platform secret and webhook secret.
+ * Vendor subscriptions additionally require both recurring Price IDs, so this
+ * check deliberately does not relax `isStripeConfigured()`.
+ */
+export const isStripePaymentConfigured = (): boolean =>
+  !isPlaceholder(env.stripeSecretKey) && isStripeWebhookSecret(env.stripeWebhookSecret);
+
 /** True only when all four Stripe values are present and non-placeholder. */
 export const isStripeConfigured = (): boolean =>
   !isPlaceholder(env.stripeSecretKey) &&
@@ -132,4 +140,12 @@ export const stripeConfigIssue = (): string | null => {
     return "STRIPE_PRICE_ID_YEARLY must be a Stripe Price ID (price_...), not a Product ID";
   }
   return "Stripe is not fully configured";
+};
+
+/** Non-secret diagnostic for customer one-time payment endpoints. */
+export const stripePaymentConfigIssue = (): string | null => {
+  if (isStripePaymentConfigured()) return null;
+  if (!env.stripeSecretKey) return "STRIPE_SECRET_KEY is not configured";
+  if (!env.stripeWebhookSecret) return "STRIPE_WEBHOOK_SECRET is not configured";
+  return "STRIPE_WEBHOOK_SECRET must be a valid Stripe webhook signing secret";
 };

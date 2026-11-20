@@ -2,15 +2,41 @@ import type {
   FavoriteDoc,
   MenuItemDoc,
   OrderDoc,
+  OrderStatus,
   RatingDistribution,
   RestaurantDoc,
   ReviewDoc,
+  TransactionDoc,
   UserDoc,
 } from "../types/models.js";
 import { getEffectiveSubscription } from "../services/subscription.service.js";
 
 const id = (value: { _id: { toHexString: () => string } }): string =>
   value._id.toHexString();
+
+/**
+ * A vendor needs to recognise a customer, not receive an extra copy of their
+ * email address. Keep enough of the address to be useful while masking the
+ * locally identifiable part.
+ */
+const customerReference = (transaction: TransactionDoc): string | null => {
+  if (transaction.customerEmail) {
+    const at = transaction.customerEmail.lastIndexOf("@");
+    if (at > 0) {
+      const local = transaction.customerEmail.slice(0, at);
+      const domain = transaction.customerEmail.slice(at + 1);
+      return `${local.slice(0, 1)}***@${domain}`;
+    }
+  }
+  if (transaction.customerId) return `customer ${transaction.customerId.slice(0, 8)}`;
+  return null;
+};
+
+export type TransactionEnrichment = {
+  orderNumber?: string | null;
+  orderCreatedAt?: Date | string | null;
+  orderStatus?: OrderStatus | null;
+};
 
 export const userDto = (user: UserDoc) => {
   const effective = getEffectiveSubscription(user);
@@ -155,6 +181,45 @@ export const restaurantDto = (
   updatedAt: restaurant.updatedAt,
 });
 
+/** One DTO for the centralized transaction ledger, whichever payment type it is. */
+export const transactionDto = (
+  transaction: TransactionDoc,
+  enrichment: TransactionEnrichment = {},
+) => ({
+  id: transaction._id.toHexString(),
+  paymentType: transaction.paymentType ?? "vendor_subscription",
+  vendorId: transaction.vendorId,
+  vendorName: transaction.vendorName,
+  vendorEmail: transaction.vendorEmail,
+  customerId: transaction.customerId ?? null,
+  customerName: transaction.customerName ?? null,
+  customerEmail: transaction.customerEmail ?? null,
+  customerReference: customerReference(transaction),
+  restaurantId: transaction.restaurantId ?? null,
+  restaurantName: transaction.restaurantName ?? null,
+  orderId: transaction.orderId ?? null,
+  orderNumber: enrichment.orderNumber ?? null,
+  orderCreatedAt: enrichment.orderCreatedAt ?? null,
+  orderStatus: enrichment.orderStatus ?? null,
+  plan: transaction.plan ?? null,
+  billingInterval: transaction.billingInterval ?? null,
+  amount: transaction.amount,
+  currency: transaction.currency,
+  status: transaction.status,
+  paymentStatus: transaction.paymentStatus ?? null,
+  paymentMethod: transaction.paymentMethod ?? null,
+  stripeEventId: transaction.stripeEventId,
+  stripeInvoiceId: transaction.stripeInvoiceId ?? null,
+  stripeSessionId: transaction.stripeSessionId ?? null,
+  stripePaymentIntentId: transaction.stripePaymentIntentId ?? null,
+  stripeSubscriptionId: transaction.stripeSubscriptionId ?? null,
+  description: transaction.description ?? null,
+  refundedAmount: transaction.refundedAmount ?? 0,
+  refunds: transaction.refunds ?? [],
+  createdAt: transaction.createdAt,
+  updatedAt: transaction.updatedAt ?? transaction.createdAt,
+});
+
 export const orderDto = (
   order: OrderDoc,
   restaurantName?: string | null,
@@ -177,6 +242,20 @@ export const orderDto = (
   // Live lookup first, then the name captured on the order for history.
   restaurantName:
     restaurantName ?? order.menuItemSnapshot.restaurantName ?? null,
+  // Only checkout orders carry these keys; legacy Stripe-free orders remain
+  // byte-for-byte compatible with existing API consumers.
+  ...(order.restaurantId ? { restaurantId: order.restaurantId.toHexString() } : {}),
+  ...(order.items ? { items: order.items } : {}),
+  ...(order.subtotal !== undefined ? { subtotal: order.subtotal } : {}),
+  ...(order.deliveryFee !== undefined ? { deliveryFee: order.deliveryFee } : {}),
+  ...(order.totalAmount !== undefined ? { totalAmount: order.totalAmount } : {}),
+  ...(order.currency ? { currency: order.currency } : {}),
+  ...(order.paymentMethod ? { paymentMethod: order.paymentMethod } : {}),
+  ...(order.paymentStatus ? { paymentStatus: order.paymentStatus } : {}),
+  ...(order.stripeSessionId ? { stripeSessionId: order.stripeSessionId } : {}),
+  ...(order.stripePaymentIntentId
+    ? { stripePaymentIntentId: order.stripePaymentIntentId }
+    : {}),
   createdAt: order.createdAt,
   updatedAt: order.updatedAt,
 });

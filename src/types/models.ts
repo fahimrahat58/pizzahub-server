@@ -13,6 +13,15 @@ export type BillingPlanId = "monthly" | "yearly";
 /** Actual recurring interval read from the Stripe Price on a subscription. */
 export type BillingInterval = "month" | "year";
 
+/** Payment lifecycle shared by customer orders and vendor subscriptions. */
+export type PaymentStatus = "pending" | "paid" | "failed" | "refunded";
+
+/** Keeps customer order payments separate from vendor subscription payments. */
+export type PaymentType = "customer_order" | "vendor_subscription";
+
+/** Only online card payments are supported for customer orders. */
+export type PaymentMethod = "stripe";
+
 /** Mirrors Stripe's subscription statuses that PizzaHub cares about. */
 export type SubscriptionStatus =
   | "active"
@@ -71,6 +80,26 @@ export interface UserDoc {
   updatedAt: Date;
 }
 
+/** One server-validated cart per customer. Prices are always recalculated. */
+export interface CartItemDoc {
+  menuItemId: ObjectId;
+  /** Captured so a cart cannot silently mix unrelated restaurants. */
+  restaurantId?: ObjectId | null;
+  vendorId?: string | null;
+  quantity: number;
+  addedAt: Date;
+  updatedAt: Date;
+}
+
+export interface CartDoc {
+  /** Customer user id as a string. */
+  _id: string;
+  customerId: string;
+  items: CartItemDoc[];
+  createdAt: Date;
+  updatedAt: Date;
+}
+
 /**
  * One record per verified Stripe webhook event. Used for idempotency and for
  * the admin's read-only billing history view.
@@ -110,22 +139,50 @@ export interface SubscriptionEventDoc {
 
 export type ApprovalStatus = "pending" | "approved" | "rejected";
 
-/** Read-only billing record created from verified Stripe webhooks. */
+export interface RefundRecord {
+  id: string;
+  stripeRefundId: string;
+  amount: number;
+  currency: string;
+  reason?: string | null;
+  createdAt: Date;
+}
+
+/**
+ * Centralized payment ledger. Vendor subscriptions and customer orders share
+ * this collection but never share their relationship fields.
+ */
 export interface TransactionDoc {
   _id: ObjectId;
+  /** Older rows predate this field; all newly written rows set it. */
+  paymentType?: PaymentType | null;
   vendorId: string;
   vendorName: string;
   vendorEmail: string;
-  plan: SubscriptionPlan;
+  plan?: SubscriptionPlan | null;
   billingInterval?: BillingInterval | null;
+  /** Customer-order relationships. Absent on subscription transactions. */
+  customerId?: string | null;
+  customerName?: string | null;
+  customerEmail?: string | null;
+  restaurantId?: string | null;
+  restaurantName?: string | null;
+  orderId?: string | null;
   amount: number;
   currency: string;
-  status: SubscriptionStatus;
+  status: SubscriptionStatus | PaymentStatus;
+  paymentStatus?: PaymentStatus | null;
+  paymentMethod?: PaymentMethod | null;
   stripeEventId: string;
   stripeInvoiceId?: string | null;
+  stripeSessionId?: string | null;
+  stripePaymentIntentId?: string | null;
   stripeSubscriptionId?: string | null;
   description?: string | null;
+  refundedAmount?: number;
+  refunds?: RefundRecord[];
   createdAt: Date;
+  updatedAt?: Date;
 }
 
 export interface MenuItemDoc {
@@ -198,6 +255,17 @@ export interface TimelineEntry {
   by: "customer" | "vendor" | "system";
 }
 
+/** Server-captured line item for multi-item checkout orders. */
+export interface OrderItemSnapshot {
+  menuItemId: string;
+  name: string;
+  image: string;
+  unitPrice: number;
+  quantity: number;
+  lineTotal: number;
+  restaurantName?: string | null;
+}
+
 export interface OrderDoc {
   _id: ObjectId;
   orderNumber: string;
@@ -228,6 +296,23 @@ export interface OrderDoc {
     /** Captured at order time so historical orders keep a restaurant label. */
     restaurantName?: string | null;
   };
+
+  // --- Customer checkout/payment fields (absent on retired legacy order writes) ---
+  restaurantId?: ObjectId | null;
+  /** Server-captured items for multi-item orders. Legacy orders use the fields above. */
+  items?: OrderItemSnapshot[];
+  subtotal?: number;
+  deliveryFee?: number;
+  totalAmount?: number;
+  currency?: string;
+  paymentMethod?: PaymentMethod | null;
+  paymentStatus?: PaymentStatus | null;
+  stripeSessionId?: string | null;
+  stripePaymentIntentId?: string | null;
+  /** Client-generated token that makes repeated checkout submissions idempotent. */
+  checkoutIdempotencyKey?: string | null;
+  /** Server-derived cart fingerprint that prevents two tabs paying for one cart. */
+  checkoutCartKey?: string | null;
   createdAt: Date;
   updatedAt: Date;
 }

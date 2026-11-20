@@ -1,8 +1,12 @@
 import type { Request, Response } from "express";
 import type Stripe from "stripe";
 
-import { env, isStripeConfigured } from "../config/env.js";
-import { getStripe } from "../config/stripe.js";
+import {
+  env,
+  isStripeConfigured,
+  isStripePaymentConfigured,
+} from "../config/env.js";
+import { getStripe, getStripeForPayments } from "../config/stripe.js";
 import {
   claimStripeEvent,
   completeStripeEvent,
@@ -15,6 +19,12 @@ import {
   syncSubscription,
   type SubscriptionSyncInput,
 } from "../services/subscription.service.js";
+import {
+  applyCustomerCheckoutExpired,
+  applyCustomerCheckoutSucceeded,
+  applyCustomerPaymentFailed,
+  applyStripeRefund,
+} from "../services/payment.service.js";
 import { asyncHandler } from "../utils/errors.js";
 import { isValidObjectId } from "../utils/query.js";
 import type {
@@ -72,7 +82,9 @@ const resolveSubscription = async (
  * Stripe, never from a browser request.
  */
 const applyEvent = async (event: Stripe.Event): Promise<void> => {
-  const stripe = getStripe();
+  // The existing recurring-price check remains a subscription concern only.
+  // Customer one-time payments work with the shared platform Stripe account.
+  const stripe = isStripeConfigured() ? getStripe() : getStripeForPayments();
   const eventId = event.id;
   const eventCreated = eventSecondsOf(event);
   let vendorId: string | null = null;
@@ -87,6 +99,123 @@ const applyEvent = async (event: Stripe.Event): Promise<void> => {
   // Subscription checkouts are recorded when their first invoice is paid.
   // Recording the checkout event too would create a second row for one payment.
   let skipCheckoutTransaction = false;
+
+  /*
+   * Customer order payments are handled in their own branch. They use the same
+   * verified event envelope and idempotency ledger, but must never fall through
+   * to the vendor-subscription logic below.
+   */
+  const isCustomerOrderSuccess =
+    event.type === "checkout.session.completed" ||
+    event.type === "checkout.session.async_payment_succeeded";
+  const isCheckoutSessionEvent =
+    isCustomerOrderSuccess ||
+    event.type === "checkout.session.async_payment_failed" ||
+    event.type === "checkout.session.expired";
+  let checkoutSession: Stripe.Checkout.Session | null = null;
+  if (isCheckoutSessionEvent) {
+    let session = event.data.object as Stripe.Checkout.Session;
+    // Stripe CLI/local snapshots can be thin or can arrive before
+    // payment_status is refreshed. The signature is already verified, so it is
+    // safe to re-read the authoritative Checkout Session by its event id.
+    const needsAuthoritativeSnapshot =
+      !session.mode ||
+      !session.metadata ||
+      (isCustomerOrderSuccess && session.payment_status !== "paid");
+    if (needsAuthoritativeSnapshot) {
+      session = await getStripeForPayments().checkout.sessions.retrieve(session.id);
+    }
+    checkoutSession = session;
+
+    const looksLikeCustomerOrder =
+      session.mode === "payment" ||
+      session.metadata?.paymentType === "customer_order";
+    const looksLikeSubscription =
+      session.mode === "subscription" ||
+      Boolean(session.metadata?.vendorId || session.metadata?.plan);
+    // A thin/unclassified payload must not be misread as a subscription
+    // checkout. Refuse it so Stripe retries with a full snapshot.
+    if (!looksLikeCustomerOrder && !looksLikeSubscription) {
+      throw new Error(
+        `Checkout Session webhook is missing trusted classification metadata: ${event.id}`,
+      );
+    }
+    if (
+      looksLikeCustomerOrder &&
+      (session.mode !== "payment" || session.metadata?.paymentType !== "customer_order")
+    ) {
+      throw new Error(
+        `Customer order Checkout Session is missing trusted metadata: ${session.id}`,
+      );
+    }
+  }
+
+  if (isCustomerOrderSuccess) {
+    const session = checkoutSession!;
+    if (
+      session.mode === "payment" &&
+      session.metadata?.paymentType === "customer_order"
+    ) {
+      const order = await applyCustomerCheckoutSucceeded(eventId, session);
+      console.info("Customer order Checkout Session processed", {
+        eventId,
+        sessionId: session.id,
+        orderId: order?._id.toHexString() ?? null,
+        paid: Boolean(order),
+      });
+      return;
+    }
+  }
+
+  if (event.type === "checkout.session.async_payment_failed") {
+    const session = checkoutSession!;
+    if (
+      session.mode === "payment" &&
+      session.metadata?.paymentType === "customer_order"
+    ) {
+      await applyCustomerPaymentFailed(
+        eventId,
+        session.metadata,
+        session.client_reference_id,
+        idOf(session.payment_intent),
+        session.id,
+      );
+      return;
+    }
+  }
+
+  if (event.type === "checkout.session.expired") {
+    const session = checkoutSession!;
+    if (
+      session.mode === "payment" &&
+      session.metadata?.paymentType === "customer_order"
+    ) {
+      await applyCustomerCheckoutExpired(session);
+      return;
+    }
+  }
+
+  if (event.type === "payment_intent.payment_failed") {
+    const paymentIntent = event.data.object;
+    if (paymentIntent.metadata?.paymentType === "customer_order") {
+      await applyCustomerPaymentFailed(
+        eventId,
+        paymentIntent.metadata,
+        null,
+        paymentIntent.id,
+      );
+      return;
+    }
+  }
+
+  if (event.type === "charge.refunded") {
+    const transaction = await applyStripeRefund(eventId, event.data.object);
+    console.info("Stripe refund processed", {
+      eventId,
+      transactionId: transaction?._id.toHexString() ?? null,
+    });
+    return;
+  }
 
   switch (event.type) {
     case "checkout.session.expired": {
@@ -294,8 +423,8 @@ export const stripeWebhook = asyncHandler(async (req: Request, res: Response) =>
     bodyBytes: Buffer.isBuffer(req.body) ? req.body.length : null,
   });
 
-  if (!isStripeConfigured()) {
-    res.status(503).json({ success: false, message: "Billing is not configured" });
+  if (!isStripePaymentConfigured()) {
+    res.status(503).json({ success: false, message: "Payments are not configured" });
     return;
   }
 
@@ -310,7 +439,8 @@ export const stripeWebhook = asyncHandler(async (req: Request, res: Response) =>
 
   let event: Stripe.Event;
   try {
-    event = getStripe().webhooks.constructEvent(
+    const stripe = isStripeConfigured() ? getStripe() : getStripeForPayments();
+    event = stripe.webhooks.constructEvent(
       req.body,
       signature,
       env.stripeWebhookSecret,
@@ -335,6 +465,17 @@ export const stripeWebhook = asyncHandler(async (req: Request, res: Response) =>
       eventType: event.type,
     });
     res.json({ received: true, duplicate: true });
+    return;
+  }
+  if (claim === "processing") {
+    // Do not acknowledge a concurrent delivery: the first attempt may still
+    // fail, and an ACK here would make Stripe stop retrying permanently.
+    console.warn("Stripe webhook is already being processed", {
+      eventId: event.id,
+      eventType: event.type,
+    });
+    res.setHeader("Retry-After", "2");
+    res.status(409).json({ received: false, retry: true });
     return;
   }
 

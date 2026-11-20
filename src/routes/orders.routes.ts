@@ -33,7 +33,12 @@ router.get("/admin", requireRole("admin"), listAllOrders);
 router.get("/vendor/unseen", requireRole("vendor"), getVendorUnseenOrderCount);
 router.post("/vendor/seen", requireRole("vendor"), markVendorOrdersSeen);
 
-router.get("/:id", validateParams(objectIdParamSchema), getOrder);
+router.get(
+  "/:id",
+  requireRole("customer", "vendor", "admin"),
+  validateParams(objectIdParamSchema),
+  getOrder,
+);
 router.patch(
   "/:id/cancel",
   requireRole("customer"),

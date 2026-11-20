@@ -118,6 +118,65 @@ export const createIndexes = async (): Promise<void> => {
         ),
     },
     {
+      name: "carts.customer",
+      run: () =>
+        collections.carts().createIndex({ customerId: 1 }, { unique: true }),
+    },
+    {
+      name: "orders.checkoutKey",
+      run: () =>
+        collections.orders().createIndex(
+          { checkoutIdempotencyKey: 1 },
+          {
+            name: "orders_checkout_key_uidx",
+            unique: true,
+            partialFilterExpression: { checkoutIdempotencyKey: { $type: "string" } },
+          },
+        ),
+    },
+    {
+      name: "orders.activeCheckout",
+      // One payable Checkout Session per customer/cart. Failed and paid orders
+      // leave the partial index, so a deliberate new purchase is still allowed.
+      run: () =>
+        collections.orders().createIndex(
+          { customerId: 1, checkoutCartKey: 1 },
+          {
+            name: "orders_one_active_checkout_per_cart_uidx",
+            unique: true,
+            partialFilterExpression: {
+              paymentStatus: "pending",
+              paymentMethod: "stripe",
+              checkoutCartKey: { $type: "string" },
+            },
+          },
+        ),
+    },
+    {
+      name: "orders.stripeSession",
+      run: () =>
+        collections.orders().createIndex(
+          { stripeSessionId: 1 },
+          {
+            name: "orders_stripe_session_uidx",
+            unique: true,
+            partialFilterExpression: { stripeSessionId: { $type: "string" } },
+          },
+        ),
+    },
+    {
+      name: "orders.stripePaymentIntent",
+      run: () =>
+        collections.orders().createIndex(
+          { stripePaymentIntentId: 1 },
+          {
+            name: "orders_stripe_payment_intent_uidx",
+            unique: true,
+            partialFilterExpression: { stripePaymentIntentId: { $type: "string" } },
+          },
+        ),
+    },
+    {
       name: "favorites.unique",
       run: () =>
         collections
@@ -242,6 +301,56 @@ export const createIndexes = async (): Promise<void> => {
             { stripeInvoiceId: 1 },
             { unique: true, sparse: true },
           ),
+    },
+    {
+      name: "transactions.customer",
+      run: () =>
+        collections
+          .transactions()
+          .createIndex({ customerId: 1, createdAt: -1 }),
+    },
+    {
+      name: "transactions.paymentType",
+      run: () =>
+        collections
+          .transactions()
+          .createIndex({ paymentType: 1, createdAt: -1 }),
+    },
+    {
+      name: "transactions.order",
+      run: () =>
+        collections.transactions().createIndex(
+          { orderId: 1 },
+          {
+            name: "transactions_order_uidx",
+            unique: true,
+            partialFilterExpression: { orderId: { $type: "string" } },
+          },
+        ),
+    },
+    {
+      name: "transactions.stripeSession",
+      run: () =>
+        collections.transactions().createIndex(
+          { stripeSessionId: 1 },
+          {
+            name: "transactions_stripe_session_uidx",
+            unique: true,
+            partialFilterExpression: { stripeSessionId: { $type: "string" } },
+          },
+        ),
+    },
+    {
+      name: "transactions.stripePaymentIntent",
+      run: () =>
+        collections.transactions().createIndex(
+          { stripePaymentIntentId: 1 },
+          {
+            name: "transactions_stripe_payment_intent_uidx",
+            unique: true,
+            partialFilterExpression: { stripePaymentIntentId: { $type: "string" } },
+          },
+        ),
     },
   ];
 

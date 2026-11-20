@@ -1,13 +1,9 @@
-import { randomBytes } from "node:crypto";
 import type { Request, Response } from "express";
 import { ObjectId, type Document } from "mongodb";
 import { z } from "zod";
 
 import { collections } from "../config/database.js";
-import {
-  sendNewOrderEmails,
-  sendOrderStatusEmail,
-} from "../services/email.service.js";
+import { sendOrderStatusEmail } from "../services/email.service.js";
 import {
   asyncHandler,
   badRequest,
@@ -24,34 +20,11 @@ import {
   type TimelineEntry,
 } from "../types/models.js";
 
-const createOrderSchema = z
-  .object({
-    menuItemId: z.string().regex(/^[a-fA-F0-9]{24}$/, "Invalid pizza"),
-    quantity: z.number().int().min(1).max(20),
-    deliveryAddress: z.string().trim().min(10).max(300),
-    deliveryDate: z
-      .string()
-      .regex(/^\d{4}-\d{2}-\d{2}$/, "Select a valid delivery date"),
-    message: z.string().trim().max(500).optional().default(""),
-  })
-  .strict();
-
 export const statusSchema = z
   .object({
     status: z.enum(["preparing", "out_for_delivery", "delivered"]),
   })
   .strict();
-
-const dateIsValid = (value: string): boolean => {
-  const date = new Date(`${value}T00:00:00Z`);
-  if (Number.isNaN(date.getTime())) return false;
-  if (date.toISOString().slice(0, 10) !== value) return false;
-  const today = new Date();
-  const startOfToday = new Date(
-    Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate()),
-  );
-  return date.getTime() >= startOfToday.getTime();
-};
 
 /**
  * `deliveryDate` is a date-only string (YYYY-MM-DD), not a UTC instant. Compare
@@ -87,6 +60,13 @@ const canAccessOrder = (order: OrderDoc, user: RequestUser): boolean =>
   (user.role === "customer" && order.customerId === user.id) ||
   (user.role === "vendor" && order.vendorId === user.id);
 
+const PAID_FULFILMENT_STATUSES: OrderStatus[] = [
+  "accepted",
+  "preparing",
+  "out_for_delivery",
+  "delivered",
+];
+
 const findOrderForRequest = async (
   req: Request,
 ): Promise<OrderDoc> => {
@@ -113,130 +93,17 @@ const findOrderForRequest = async (
   return order;
 };
 
-export const createOrder = asyncHandler(async (req: Request, res: Response) => {
+/**
+ * Retired unpaid order write. The route stays mounted for a clear API error,
+ * but no customer can create a fulfillable order outside Stripe Checkout.
+ */
+export const createOrder = asyncHandler(async (req: Request, _res: Response) => {
   if (req.user!.role !== "customer") {
     throw forbidden("Only customers can place orders");
   }
-
-  const data = createOrderSchema.parse(req.body);
-  if (!dateIsValid(data.deliveryDate)) {
-    throw badRequest("Delivery date must be today or a future date");
-  }
-
-  const item = await collections.menuItems().findOne({
-    _id: new ObjectId(data.menuItemId),
-    approvalStatus: "approved",
-    isActive: true,
-  });
-  if (!item) throw notFound("This pizza is not available for ordering");
-
-  // The vendor comes from the database, never from the request body.
-  if (item.vendorId === req.user!.id) {
-    throw forbidden("Vendors cannot order their own menu items");
-  }
-
-  const vendor = await collections
-    .users()
-    .findOne({ _id: new ObjectId(item.vendorId) });
-  if (!vendor || vendor.isBlocked || vendor.role !== "vendor") {
-    throw notFound("This restaurant is currently unavailable");
-  }
-
-  // Keep a human-readable restaurant label on the order so history survives
-  // even if the menu item or restaurant is later removed.
-  const restaurant = item.restaurantId
-    ? await collections
-        .restaurants()
-        .findOne(
-          { _id: item.restaurantId },
-          { projection: { name: 1, isAvailable: 1 } },
-        )
-    : null;
-  if (restaurant?.isAvailable === false) {
-    throw notFound("This restaurant is currently unavailable");
-  }
-
-  const now = new Date();
-  const orderNumber = `PH-${now.toISOString().slice(0, 10).replace(/-/g, "")}-${randomBytes(3).toString("hex").toUpperCase()}`;
-  const totalPrice = Math.round(item.price * data.quantity * 100) / 100;
-
-  const order: OrderDoc = {
-    _id: new ObjectId(),
-    orderNumber,
-    customerId: req.user!.id,
-    vendorId: item.vendorId,
-    menuItemId: item._id,
-    quantity: data.quantity,
-    unitPrice: item.price,
-    totalPrice,
-    deliveryAddress: data.deliveryAddress,
-    deliveryDate: data.deliveryDate,
-    message: data.message,
-    status: "pending",
-    vendorSeen: false,
-    timeline: [entry("pending", "customer", "Order placed")],
-    activeOrderKey: `${req.user!.id}:${item._id.toHexString()}:${data.deliveryDate}`,
-    customerSnapshot: {
-      name: req.user!.name,
-      email: req.user!.email,
-      image: req.user!.image ?? null,
-    },
-    menuItemSnapshot: {
-      name: item.name,
-      image: item.image,
-      price: item.price,
-      restaurantName: restaurant?.name ?? null,
-    },
-    createdAt: now,
-    updatedAt: now,
-  };
-
-  try {
-    await collections.orders().insertOne(order);
-  } catch (error) {
-    if (
-      typeof error === "object" &&
-      error !== null &&
-      "code" in error &&
-      error.code === 11000
-    ) {
-      throw conflict("You already have an active order for this pizza on that date");
-    }
-    throw error;
-  }
-
-  // Email is a side effect of a successfully stored order. The service never
-  // throws, but this guard keeps a provider outage from changing the API result.
-  let email: Awaited<ReturnType<typeof sendNewOrderEmails>> | undefined;
-  try {
-    email = await sendNewOrderEmails({
-      vendorEmail: vendor.email,
-      vendorName: vendor.businessName?.trim() || vendor.name,
-      customerName: order.customerSnapshot.name,
-      customerEmail: order.customerSnapshot.email,
-      orderNumber: order.orderNumber,
-      itemName: order.menuItemSnapshot.name,
-      restaurantName: restaurant?.name ?? order.menuItemSnapshot.restaurantName,
-      quantity: order.quantity,
-      unitPrice: order.unitPrice,
-      totalPrice: order.totalPrice,
-      deliveryAddress: order.deliveryAddress,
-      deliveryDate: order.deliveryDate,
-      message: order.message,
-    });
-  } catch (caught) {
-    console.error(
-      "[email] Unexpected new-order email failure:",
-      caught instanceof Error ? caught.message : "unknown error",
-    );
-  }
-
-  res.status(201).json({
-    success: true,
-    message: "Order placed successfully",
-    order: orderDto(order),
-    ...(email ? { email } : {}),
-  });
+  throw badRequest(
+    "Direct order placement is disabled. Add items to your cart and use Stripe Checkout.",
+  );
 });
 
 /**
@@ -404,6 +271,10 @@ const changeStatus = async (
       `This order cannot be updated from status "${order.status}" to "${nextStatus}"`,
     );
   }
+  const requiresVerifiedPayment = PAID_FULFILMENT_STATUSES.includes(nextStatus);
+  if (requiresVerifiedPayment && order.paymentStatus !== "paid") {
+    throw conflict("This order cannot be fulfilled until Stripe confirms payment");
+  }
   if (req.user!.role !== by && !(by === "vendor" && req.user!.role === "vendor")) {
     throw forbidden("You cannot perform this action");
   }
@@ -418,6 +289,7 @@ const changeStatus = async (
     {
       _id: order._id,
       status: { $in: allowedFrom },
+      ...(requiresVerifiedPayment ? { paymentStatus: "paid" } : {}),
       ...orderAccessFilter(req.user!),
     },
     [

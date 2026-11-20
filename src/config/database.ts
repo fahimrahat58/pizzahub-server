@@ -4,6 +4,7 @@ import { MongoClient, type Collection, type Db, type ObjectId } from "mongodb";
 
 import { env } from "./env.js";
 import type {
+  CartDoc,
   CheckoutLockDoc,
   FavoriteDoc,
   MenuItemDoc,
@@ -55,6 +56,7 @@ export const collections = {
   restaurants: (): Collection<RestaurantDoc> =>
     db.collection<RestaurantDoc>("restaurants"),
   orders: (): Collection<OrderDoc> => db.collection<OrderDoc>("orders"),
+  carts: (): Collection<CartDoc> => db.collection<CartDoc>("carts"),
   favorites: (): Collection<FavoriteDoc> =>
     db.collection<FavoriteDoc>("favorites"),
   reviews: (): Collection<ReviewDoc> => db.collection<ReviewDoc>("reviews"),

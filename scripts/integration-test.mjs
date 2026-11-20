@@ -179,6 +179,7 @@ assert.ok(process.env.STRIPE_WEBHOOK_SECRET?.trim(), "STRIPE_WEBHOOK_SECRET is r
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 const webhookEventIds = [];
 const checkoutSessionIds = [];
+const checkoutOrderIds = [];
 
 // Abandoning a Checkout Session must release the short-lived duplicate-checkout
 // guard so a vendor can immediately start a new purchase.
@@ -1098,6 +1099,33 @@ try {
   assert.equal(checkoutCompleted.response.status, 200, JSON.stringify(checkoutCompleted.data));
   pass("Verified checkout.session.completed events are accepted");
 
+  const unclassifiedEventId = `evt_it_unclassified_${suffix}`;
+  webhookEventIds.push(unclassifiedEventId);
+  const unclassified = await sendWebhook({
+    id: unclassifiedEventId,
+    object: "event",
+    type: "checkout.session.completed",
+    created: Math.floor(Date.now() / 1000),
+    data: {
+      object: {
+        id: `cs_test_unclassified_${suffix}`,
+        object: "checkout.session",
+        amount_total: 1500,
+        currency: "usd",
+      },
+    },
+  });
+  assert.equal(unclassified.response.status, 500, JSON.stringify(unclassified.data));
+  const unclassifiedClaim = await db
+    .collection("stripeEvents")
+    .findOne({ _id: unclassifiedEventId });
+  assert.equal(unclassifiedClaim, null, "unclassified events must stay retryable");
+  const unclassifiedTransaction = await db
+    .collection("transactions")
+    .findOne({ stripeEventId: unclassifiedEventId });
+  assert.equal(unclassifiedTransaction, null, "unclassified events must not create payments");
+  pass("Unclassified Checkout Session webhooks are retried instead of creating subscription rows");
+
   const transactionList = await api("admin", "GET", "/api/admin/transactions");
   const checkoutTransaction = transactionList.transactions.find(
     (entry) => entry.stripeEventId === checkoutEventId,
@@ -1521,26 +1549,106 @@ try {
     deliveryDate,
     message: "Extra napkins please",
   };
-  const transactionsBeforeOrder = await api("admin", "GET", "/api/admin/transactions");
-  const created = await api("customer", "POST", "/api/orders", orderPayload, 201);
-  const order = created.order;
-  assert.equal(order.status, "pending");
-  assert.ok(created.email, "new order response must include email results");
-  assert.equal(typeof created.email.vendor.sent, "boolean");
-  assert.equal(typeof created.email.customer.sent, "boolean");
-  const paymentLikeKeys = Object.keys(order).filter((key) =>
-    /stripe|payment|checkout/i.test(key),
+
+  // The retired direct-order route must never create a fulfillable order, even
+  // when a client sends a spoofed payment status or total.
+  const directOrderBlocked = await api(
+    "customer",
+    "POST",
+    "/api/orders",
+    { ...orderPayload, paymentStatus: "paid", totalPrice: 0.01 },
+    400,
   );
-  assert.deepEqual(paymentLikeKeys, [], "order DTO must not contain payment fields");
+  assert.match(directOrderBlocked.message, /Direct order placement is disabled/);
+  const directOrderCount = await db.collection("orders").countDocuments({
+    customerId: customer.id,
+    deliveryAddress: orderPayload.deliveryAddress,
+    paymentMethod: { $exists: false },
+  });
+  assert.equal(directOrderCount, 0, "direct order writes must not reach MongoDB");
+  pass("Direct unpaid order endpoint is disabled and ignores spoofed payment fields");
+
+  // Lifecycle/review tests need already-paid orders. Seed them through MongoDB
+  // as a fixture; all payment-specific behaviour is still exercised through the
+  // real Checkout and signed-webhook tests below.
+  let paidOrderSeed = 0;
+  const seedPaidOrder = async (payload) => {
+    paidOrderSeed += 1;
+    const item = await db
+      .collection("menuItems")
+      .findOne({ _id: new ObjectId(payload.menuItemId) });
+    assert.ok(item, "paid-order fixture needs a menu item");
+    const itemVendor = await db
+      .collection("users")
+      .findOne({ _id: new ObjectId(item.vendorId) });
+    assert.ok(itemVendor, "paid-order fixture needs a vendor");
+    const now = new Date();
+    const doc = {
+      _id: new ObjectId(),
+      orderNumber: `PH-IT-${suffix}-${paidOrderSeed}`,
+      customerId: customer.id,
+      vendorId: item.vendorId,
+      menuItemId: item._id,
+      quantity: payload.quantity,
+      unitPrice: item.price,
+      totalPrice: Math.round(item.price * payload.quantity * 100) / 100,
+      deliveryAddress: payload.deliveryAddress,
+      deliveryDate: payload.deliveryDate,
+      message: payload.message ?? "",
+      status: "pending",
+      vendorSeen: false,
+      timeline: [{ status: "pending", by: "customer", note: "Order placed", at: now }],
+      customerSnapshot: {
+        name: customer.name,
+        email: customer.email,
+        image: customer.image ?? null,
+      },
+      menuItemSnapshot: {
+        name: item.name,
+        image: item.image,
+        price: item.price,
+        restaurantName: null,
+      },
+      restaurantId: item.restaurantId ?? null,
+      items: [
+        {
+          menuItemId: item._id.toHexString(),
+          name: item.name,
+          image: item.image,
+          unitPrice: item.price,
+          quantity: payload.quantity,
+          lineTotal: Math.round(item.price * payload.quantity * 100) / 100,
+          restaurantName: null,
+        },
+      ],
+      subtotal: Math.round(item.price * payload.quantity * 100) / 100,
+      deliveryFee: 0,
+      totalAmount: Math.round(item.price * payload.quantity * 100) / 100,
+      currency: "usd",
+      paymentMethod: "stripe",
+      paymentStatus: "paid",
+      stripeSessionId: `cs_it_seed_${suffix}_${paidOrderSeed}`,
+      stripePaymentIntentId: `pi_it_seed_${suffix}_${paidOrderSeed}`,
+      createdAt: now,
+      updatedAt: now,
+    };
+    await db.collection("orders").insertOne(doc);
+    const stored = await api("customer", "GET", `/api/orders/${doc._id.toHexString()}`);
+    return stored.order;
+  };
+
+  const transactionsBeforeOrder = await api("admin", "GET", "/api/admin/transactions");
+  const order = await seedPaidOrder(orderPayload);
+  assert.equal(order.status, "pending");
+  assert.equal(order.paymentStatus, "paid");
+  assert.equal(order.paymentMethod, "stripe");
   const transactionsAfterOrder = await api("admin", "GET", "/api/admin/transactions");
   assert.equal(
     transactionsAfterOrder.transactions.length,
     transactionsBeforeOrder.transactions.length,
-    "placing a customer order must not create Stripe billing records",
+    "paid lifecycle fixtures must not create extra Stripe billing records",
   );
-  await api("customer", "POST", "/api/orders", orderPayload, 409);
-  pass("Order creation stores the order, returns email status, and blocks duplicates");
-  pass("Customer pizza orders are Stripe-free and create no payment records");
+  pass("Paid lifecycle fixtures exist only after verified Stripe payment state");
 
   const vendorOrders = await api("vendor", "GET", "/api/orders/vendor?limit=100");
   assert.ok(vendorOrders.orders.some((entry) => entry.id === order.id));
@@ -1564,31 +1672,29 @@ try {
   }
   pass("Order accept/status transitions append timeline entries");
 
-  const repeat = await api("customer", "POST", "/api/orders", orderPayload, 201);
-  await api("customer", "PATCH", `/api/orders/${repeat.order.id}/cancel`);
-  pass("Delivered orders release the active-order slot");
+  const repeat = await seedPaidOrder(orderPayload);
+  await api("customer", "PATCH", `/api/orders/${repeat.id}/cancel`);
+  pass("Paid orders can be cancelled before fulfilment");
 
-  const rejectable = await api(
-    "customer",
-    "POST",
-    "/api/orders",
-    { ...orderPayload, menuItemId: itemIds[1], quantity: 1 },
-    201,
-  );
-  const orderDetails = await api("customer", "GET", `/api/orders/${rejectable.order.id}`);
-  assert.equal(orderDetails.order.id, rejectable.order.id);
+  const rejectable = await seedPaidOrder({
+    ...orderPayload,
+    menuItemId: itemIds[1],
+    quantity: 1,
+  });
+  const orderDetails = await api("customer", "GET", `/api/orders/${rejectable.id}`);
+  assert.equal(orderDetails.order.id, rejectable.id);
   assert.ok(Array.isArray(orderDetails.order.timeline));
-  await api("otherVendor", "GET", `/api/orders/${rejectable.order.id}`, undefined, 403);
+  await api("otherVendor", "GET", `/api/orders/${rejectable.id}`, undefined, 403);
   const rejectedOrder = await api(
     "vendor",
     "PATCH",
-    `/api/orders/${rejectable.order.id}/reject`,
+    `/api/orders/${rejectable.id}/reject`,
   );
   assert.equal(rejectedOrder.order.status, "rejected");
   assert.ok(rejectedOrder.email && typeof rejectedOrder.email.sent === "boolean");
-  const adminOrderDetails = await api("admin", "GET", `/api/orders/${rejectable.order.id}`);
+  const adminOrderDetails = await api("admin", "GET", `/api/orders/${rejectable.id}`);
   assert.equal(adminOrderDetails.order.status, "rejected");
-  await api("vendor", "PATCH", `/api/orders/${rejectable.order.id}/accept`, undefined, 409);
+  await api("vendor", "PATCH", `/api/orders/${rejectable.id}/accept`, undefined, 409);
   pass("Order details enforce ownership and reject transitions return email status");
 
   const advanceToDelivered = async (targetOrderId) => {
@@ -1604,16 +1710,14 @@ try {
     }
   };
 
-  const raceOrder = await api(
-    "customer",
-    "POST",
-    "/api/orders",
-    { ...orderPayload, menuItemId: itemIds[2], quantity: 1 },
-    201,
-  );
+  const raceOrder = await seedPaidOrder({
+    ...orderPayload,
+    menuItemId: itemIds[2],
+    quantity: 1,
+  });
   const concurrentAccepts = await Promise.all([
-    rawApi("vendor", "PATCH", `/api/orders/${raceOrder.order.id}/accept`),
-    rawApi("vendor", "PATCH", `/api/orders/${raceOrder.order.id}/accept`),
+    rawApi("vendor", "PATCH", `/api/orders/${raceOrder.id}/accept`),
+    rawApi("vendor", "PATCH", `/api/orders/${raceOrder.id}/accept`),
   ]);
   assert.deepEqual(
     concurrentAccepts.map((entry) => entry.status).sort((a, b) => a - b),
@@ -1622,14 +1726,14 @@ try {
   );
   const persistedRaceOrder = await db
     .collection("orders")
-    .findOne({ _id: new ObjectId(raceOrder.order.id) });
+    .findOne({ _id: new ObjectId(raceOrder.id) });
   assert.equal(
     persistedRaceOrder.timeline.filter((entry) => entry.status === "accepted").length,
     1,
     "the losing accept must not append a duplicate timeline entry",
   );
   for (const nextStatus of ["preparing", "out_for_delivery", "delivered"]) {
-    await api("vendor", "PATCH", `/api/orders/${raceOrder.order.id}/status`, {
+    await api("vendor", "PATCH", `/api/orders/${raceOrder.id}/status`, {
       status: nextStatus,
     });
   }
@@ -1653,39 +1757,37 @@ try {
   pass("1/11 Strict review DTO rejects client-supplied customer identity");
 
   // 2. Only delivered orders are reviewable.
-  const pendingReviewOrder = await api(
-    "customer",
-    "POST",
-    "/api/orders",
-    { ...orderPayload, menuItemId: itemIds[2], quantity: 1 },
-    201,
-  );
+  const pendingReviewOrder = await seedPaidOrder({
+    ...orderPayload,
+    menuItemId: itemIds[2],
+    quantity: 1,
+  });
   await api(
     "customer",
     "POST",
     "/api/reviews",
     {
-      orderId: pendingReviewOrder.order.id,
+      orderId: pendingReviewOrder.id,
       menuItemId: itemIds[2],
       rating: 5,
       comment: "Pending order must not be reviewed",
     },
     400,
   );
-  await api("vendor", "PATCH", `/api/orders/${pendingReviewOrder.order.id}/accept`);
+  await api("vendor", "PATCH", `/api/orders/${pendingReviewOrder.id}/accept`);
   await api(
     "customer",
     "POST",
     "/api/reviews",
     {
-      orderId: pendingReviewOrder.order.id,
+      orderId: pendingReviewOrder.id,
       menuItemId: itemIds[2],
       rating: 5,
       comment: "Accepted order must not be reviewed",
     },
     400,
   );
-  await api("vendor", "PATCH", `/api/orders/${pendingReviewOrder.order.id}/status`, {
+  await api("vendor", "PATCH", `/api/orders/${pendingReviewOrder.id}/status`, {
     status: "preparing",
   });
   await api(
@@ -1693,7 +1795,7 @@ try {
     "POST",
     "/api/reviews",
     {
-      orderId: pendingReviewOrder.order.id,
+      orderId: pendingReviewOrder.id,
       menuItemId: itemIds[2],
       rating: 5,
       comment: "Preparing order must not be reviewed",
@@ -1701,8 +1803,8 @@ try {
     400,
   );
   for (const [targetOrderId, targetItemId] of [
-    [rejectable.order.id, itemIds[1]],
-    [repeat.order.id, itemIds[0]],
+    [rejectable.id, itemIds[1]],
+    [repeat.id, itemIds[0]],
   ]) {
     await api(
       "customer",
@@ -1845,14 +1947,14 @@ try {
   pass("8/11 Owner deletion recalculates ratings back to zero");
 
   // 9. Other customers and vendors cannot modify an owner's review.
-  const moderationOrder = await api("customer", "POST", "/api/orders", orderPayload, 201);
-  await advanceToDelivered(moderationOrder.order.id);
+  const moderationOrder = await seedPaidOrder(orderPayload);
+  await advanceToDelivered(moderationOrder.id);
   const moderationReview = await api(
     "customer",
     "POST",
     "/api/reviews",
     {
-      orderId: moderationOrder.order.id,
+      orderId: moderationOrder.id,
       menuItemId: itemIds[0],
       rating: 2,
       comment: "Review used for moderation checks",
@@ -2117,6 +2219,803 @@ try {
   );
   pass("ImgBB upload works server-side and rejects invalid images");
 
+  // --- Customer one-time payments (Stripe Test Mode) -------------------------
+  const paymentDeliveryDate = () => new Date().toISOString().slice(0, 10);
+  const checkoutPayload = (idempotencyKey, overrides = {}) => ({
+    deliveryAddress: "42 Pizza Lane, Delivery City",
+    deliveryDate: paymentDeliveryDate(),
+    message: "Integration test order",
+    idempotencyKey,
+    ...overrides,
+  });
+  const orderWebhookMetadata = (order) => ({
+    paymentType: "customer_order",
+    orderId: order.id,
+    customerId: customer.id,
+    vendorId: vendor.id,
+  });
+  const eventEnvelope = (id, type, object) => ({
+    id,
+    object: "event",
+    api_version: "2025-03-31.basil",
+    type,
+    created: Math.floor(Date.now() / 1000),
+    data: { object },
+  });
+  const customerSessionObject = ({
+    sessionId,
+    order,
+    status,
+    paymentStatus,
+    paymentIntentId = null,
+    amountCents,
+    currency = "usd",
+  }) => ({
+    id: sessionId,
+    object: "checkout.session",
+    mode: "payment",
+    status,
+    payment_status: paymentStatus,
+    amount_total:
+      amountCents ?? Math.round((order.totalAmount ?? order.totalPrice) * 100),
+    currency,
+    payment_intent: paymentIntentId,
+    customer: customer.id,
+    client_reference_id: customer.id,
+    metadata: orderWebhookMetadata(order),
+  });
+  const sendTrackedWebhook = async (event) => {
+    webhookEventIds.push(event.id);
+    const result = await sendWebhook(event);
+    assert.equal(result.response.status, 200, JSON.stringify(result.data));
+    return result.data;
+  };
+  const createSucceededPaymentIntent = async (amount, key) => {
+    const intent = await stripe.paymentIntents.create(
+      {
+        amount,
+        currency: "usd",
+        automatic_payment_methods: {
+          enabled: true,
+          allow_redirects: "never",
+        },
+        payment_method: "pm_card_visa",
+        confirm: true,
+        metadata: { pizzahubIntegration: key },
+      },
+      { idempotencyKey: `pizzahub-it-order-pi-${key}` },
+    );
+    assert.equal(
+      intent.status,
+      "succeeded",
+      `test PaymentIntent failed: ${JSON.stringify(intent.last_payment_error ?? {})}`,
+    );
+    return intent.id;
+  };
+  const startCheckout = async (itemId, quantity, idempotencyKey) => {
+    await api("customer", "DELETE", "/api/cart");
+    await api("customer", "POST", "/api/cart", { menuItemId: itemId, quantity });
+    const result = await api(
+      "customer",
+      "POST",
+      "/api/payments/checkout",
+      checkoutPayload(idempotencyKey),
+      201,
+    );
+    checkoutSessionIds.push(result.sessionId);
+    checkoutOrderIds.push(result.order.id);
+    return result;
+  };
+
+  await api("vendor", "GET", "/api/cart", undefined, 403);
+  await api("admin", "POST", "/api/cart", { menuItemId: itemIds[0], quantity: 1 }, 403);
+  await api("customer", "DELETE", "/api/cart");
+  const emptyCart = await api("customer", "GET", "/api/cart");
+  assert.equal(emptyCart.cart.items.length, 0);
+  const emptyCheckout = await api(
+    "customer",
+    "POST",
+    "/api/payments/checkout",
+    checkoutPayload(`empty-${suffix}`),
+    400,
+  );
+  assert.equal(emptyCheckout.message, "Your cart is empty");
+  pass("Cart and checkout are customer-only; an empty cart cannot check out");
+
+  const cartForeignRestaurant = await api(
+    "otherVendor",
+    "POST",
+    "/api/restaurants/mine",
+    {
+      name: "Foreign Cart Kitchen",
+      description: "A restaurant used for cart isolation tests",
+      image: imageUrl,
+      address: "999 Foreign Road, Pizza City",
+      phone: "+15550001111",
+      openingHours: "10:00-22:00",
+    },
+    201,
+  );
+  const cartForeignMenu = await api(
+    "otherVendor",
+    "POST",
+    "/api/menu/vendor",
+    {
+      ...menuPayload("Foreign Cart Pizza"),
+      restaurantId: cartForeignRestaurant.restaurant.id,
+    },
+    201,
+  );
+  await api(
+    "admin",
+    "PATCH",
+    `/api/menu/admin/${cartForeignMenu.item.id}/approval`,
+    { approvalStatus: "approved" },
+  );
+
+  // A stale client price must never become the source of truth: update MongoDB
+  // after the usual menu tests and confirm the cart re-reads it.
+  await db.collection("menuItems").updateOne(
+    { _id: new ObjectId(itemIds[0]) },
+    { $set: { price: 17.25 } },
+  );
+  const cartAfterAdd = await api("customer", "POST", "/api/cart", {
+    menuItemId: itemIds[0],
+    quantity: 2,
+  });
+  assert.equal(cartAfterAdd.cart.items.length, 1);
+  assert.equal(cartAfterAdd.cart.items[0].unitPrice, 17.25);
+  assert.equal(cartAfterAdd.cart.subtotal, 34.5);
+  assert.equal(cartAfterAdd.cart.deliveryFee, 2.99);
+  assert.equal(cartAfterAdd.cart.total, 37.49);
+
+  const crossRestaurant = await api(
+    "customer",
+    "POST",
+    "/api/cart",
+    { menuItemId: cartForeignMenu.item.id, quantity: 1 },
+    409,
+  );
+  assert.equal(
+    crossRestaurant.message,
+    "Your cart already contains items from another restaurant. Clear it first.",
+  );
+  await api("customer", "PATCH", `/api/cart/${itemIds[0]}`, { quantity: 0 }, 400);
+  await api("customer", "POST", "/api/cart", { menuItemId: itemIds[0], quantity: 21 }, 400);
+  await api(
+    "customer",
+    "DELETE",
+    `/api/cart/${new ObjectId().toHexString()}`,
+    undefined,
+    404,
+  );
+  const unchangedCart = await api("customer", "GET", "/api/cart");
+  assert.equal(unchangedCart.cart.itemCount, 2);
+  pass("Cart re-reads MongoDB prices, enforces quantities, and blocks cross-restaurant carts");
+
+  const badDateCheckout = await api(
+    "customer",
+    "POST",
+    "/api/payments/checkout",
+    checkoutPayload(`bad-date-${suffix}`, { deliveryDate: "2000-01-01" }),
+    400,
+  );
+  assert.equal(badDateCheckout.message, "Delivery date must be today or a future date");
+  const spoofedTotal = await api(
+    "customer",
+    "POST",
+    "/api/payments/checkout",
+    checkoutPayload(`spoof-${suffix}`, { total: 0.01, paymentStatus: "paid" }),
+    400,
+  );
+  assert.equal(spoofedTotal.message, "Invalid input");
+  pass("Checkout rejects past dates and strict-body price/status spoofing");
+
+  const paidKey = `paid-${suffix}`;
+  const paidCheckout = await api(
+    "customer",
+    "POST",
+    "/api/payments/checkout",
+    checkoutPayload(paidKey),
+    201,
+  );
+  checkoutSessionIds.push(paidCheckout.sessionId);
+  checkoutOrderIds.push(paidCheckout.order.id);
+  assert.match(paidCheckout.checkoutUrl, /^https:\/\/checkout\.stripe\.com\//);
+  assert.equal(paidCheckout.paymentStatus, "pending");
+  assert.equal(paidCheckout.order.paymentMethod, "stripe");
+  assert.equal(paidCheckout.order.paymentStatus, "pending");
+  assert.equal(paidCheckout.order.subtotal, 34.5);
+  assert.equal(paidCheckout.order.deliveryFee, 2.99);
+  assert.equal(paidCheckout.order.totalAmount, 37.49);
+  assert.equal(paidCheckout.order.items.length, 1);
+
+  const resumedCheckout = await api(
+    "customer",
+    "POST",
+    "/api/payments/checkout",
+    checkoutPayload(paidKey),
+    201,
+  );
+  assert.equal(resumedCheckout.message, "Existing checkout resumed");
+  assert.equal(resumedCheckout.sessionId, paidCheckout.sessionId);
+  assert.equal(resumedCheckout.order.id, paidCheckout.order.id);
+  const orderCount = await db.collection("orders").countDocuments({
+    checkoutIdempotencyKey: paidKey,
+  });
+  assert.equal(orderCount, 1, "duplicate checkout must not create a second order");
+
+  const sameCartCheckout = await api(
+    "customer",
+    "POST",
+    "/api/payments/checkout",
+    checkoutPayload(`same-cart-${suffix}`),
+    201,
+  );
+  assert.equal(sameCartCheckout.message, "Existing checkout resumed");
+  assert.equal(sameCartCheckout.sessionId, paidCheckout.sessionId);
+  assert.equal(sameCartCheckout.order.id, paidCheckout.order.id);
+  const activeCheckoutCount = await db.collection("orders").countDocuments({
+    customerId: customer.id,
+    paymentMethod: "stripe",
+    paymentStatus: "pending",
+  });
+  assert.equal(activeCheckoutCount, 1, "one cart must have only one active Checkout Session");
+  const concurrentTabs = await Promise.all([
+    rawApi("customer", "POST", "/api/payments/checkout", checkoutPayload(`tab-a-${suffix}`)),
+    rawApi("customer", "POST", "/api/payments/checkout", checkoutPayload(`tab-b-${suffix}`)),
+  ]);
+  assert.deepEqual(concurrentTabs.map((entry) => entry.status), [201, 201]);
+  assert.equal(concurrentTabs[0].data.sessionId, concurrentTabs[1].data.sessionId);
+  assert.equal(concurrentTabs[0].data.order.id, concurrentTabs[1].data.order.id);
+  assert.equal(concurrentTabs[0].data.sessionId, paidCheckout.sessionId);
+  pass("Duplicate keys, multiple tabs, and the same cart all reuse one pending checkout");
+
+  const blockedAccept = await api(
+    "vendor",
+    "PATCH",
+    `/api/orders/${paidCheckout.order.id}/accept`,
+    undefined,
+    409,
+  );
+  assert.match(blockedAccept.message, /Stripe confirms payment/);
+  const pendingOrderAfterAttempt = await db
+    .collection("orders")
+    .findOne({ _id: new ObjectId(paidCheckout.order.id) });
+  assert.equal(pendingOrderAfterAttempt.status, "pending");
+  assert.equal(pendingOrderAfterAttempt.paymentStatus, "pending");
+  pass("An unpaid pending order cannot be accepted or fulfilled through the order API");
+
+  const beforeWebhook = await api(
+    "customer",
+    "GET",
+    `/api/payments/session/${paidCheckout.sessionId}`,
+  );
+  assert.equal(beforeWebhook.paymentStatus, "pending");
+  assert.equal(beforeWebhook.stripePaymentStatus, "unpaid");
+
+  const unpaidEventId = `evt_it_order_unpaid_${suffix}`;
+  webhookEventIds.push(unpaidEventId);
+  const unpaidResult = await sendWebhook(
+    eventEnvelope(
+      unpaidEventId,
+      "checkout.session.completed",
+      customerSessionObject({
+        sessionId: paidCheckout.sessionId,
+        order: paidCheckout.order,
+        status: "open",
+        paymentStatus: "unpaid",
+      }),
+    ),
+  );
+  // The real Checkout Session is still unpaid in the test, so the authoritative
+  // Stripe lookup confirms it and the event must stay retryable.
+  assert.equal(unpaidResult.response.status, 500, JSON.stringify(unpaidResult.data));
+  const unpaidClaim = await db.collection("stripeEvents").findOne({ _id: unpaidEventId });
+  assert.equal(unpaidClaim, null, "an unpaid paid-event must release its claim");
+  const afterUnpaid = await api(
+    "customer",
+    "GET",
+    `/api/payments/session/${paidCheckout.sessionId}`,
+  );
+  assert.equal(afterUnpaid.paymentStatus, "pending");
+  const transactionsAfterUnpaid = await api(
+    "admin",
+    "GET",
+    `/api/admin/transactions?search=${paidCheckout.order.id}&limit=50`,
+  );
+  assert.equal(transactionsAfterUnpaid.pagination.total, 0);
+  pass("An unpaid Checkout Session stays retryable and cannot mark an order paid");
+
+  const badAmountEventId = `evt_it_order_bad_amount_${suffix}`;
+  webhookEventIds.push(badAmountEventId);
+  const badAmountResult = await sendWebhook(
+    eventEnvelope(
+      badAmountEventId,
+      "checkout.session.completed",
+      customerSessionObject({
+        sessionId: paidCheckout.sessionId,
+        order: paidCheckout.order,
+        status: "complete",
+        paymentStatus: "paid",
+        paymentIntentId: `pi_it_bad_amount_${suffix}`,
+        amountCents: 1,
+      }),
+    ),
+  );
+  assert.equal(
+    badAmountResult.response.status,
+    500,
+    JSON.stringify(badAmountResult.data),
+  );
+  const badAmountOrder = await api(
+    "customer",
+    "GET",
+    `/api/payments/session/${paidCheckout.sessionId}`,
+  );
+  assert.equal(badAmountOrder.paymentStatus, "pending");
+  const badAmountClaim = await db
+    .collection("stripeEvents")
+    .findOne({ _id: badAmountEventId });
+  assert.equal(
+    badAmountClaim,
+    null,
+    "a rejected paid event must release its claim so Stripe can retry",
+  );
+  pass("A paid webhook with the wrong amount is rejected, does not mark paid, and stays retryable");
+
+  const missingOrderEventId = `evt_it_order_missing_${suffix}`;
+  webhookEventIds.push(missingOrderEventId);
+  const missingOrderResult = await sendWebhook(
+    eventEnvelope(
+      missingOrderEventId,
+      "checkout.session.completed",
+      customerSessionObject({
+        sessionId: `cs_test_missing_${suffix}`,
+        order: {
+          id: new ObjectId().toHexString(),
+          totalAmount: 12.34,
+          totalPrice: 12.34,
+        },
+        status: "complete",
+        paymentStatus: "paid",
+        paymentIntentId: "pi_it_missing_order",
+      }),
+    ),
+  );
+  assert.equal(missingOrderResult.response.status, 500, JSON.stringify(missingOrderResult.data));
+  const missingOrderClaim = await db
+    .collection("stripeEvents")
+    .findOne({ _id: missingOrderEventId });
+  assert.equal(
+    missingOrderClaim,
+    null,
+    "a paid event for an unknown order must stay retryable",
+  );
+  pass("A paid webhook for an unknown order stays retryable and never ACKs a stuck order");
+
+  const paidAmountCents = Math.round(paidCheckout.order.totalAmount * 100);
+  const paidIntentId = await createSucceededPaymentIntent(paidAmountCents, paidKey);
+  const paidEventId = `evt_it_order_paid_${suffix}`;
+  const paidEvent = eventEnvelope(
+    paidEventId,
+    "checkout.session.completed",
+    customerSessionObject({
+      sessionId: paidCheckout.sessionId,
+      order: paidCheckout.order,
+      status: "complete",
+      paymentStatus: "paid",
+      paymentIntentId: paidIntentId,
+    }),
+  );
+  await db.collection("transactions").insertOne({
+    _id: new ObjectId(),
+    paymentType: "vendor_subscription",
+    vendorId: vendor.id,
+    status: "incomplete",
+    amount: Math.round(paidCheckout.order.totalAmount * 100) / 100,
+    currency: "usd",
+    stripeEventId: paidEventId,
+    description: "Checkout completed",
+    createdAt: new Date(),
+    updatedAt: new Date(),
+  });
+  const paidWebhookResult = await sendTrackedWebhook(paidEvent);
+  assert.equal(paidWebhookResult.processed, true);
+  const repairedTransaction = await db
+    .collection("transactions")
+    .findOne({ stripeEventId: paidEventId });
+  assert.equal(repairedTransaction?.orderId, paidCheckout.order.id);
+  assert.equal(repairedTransaction?.status, "paid");
+  assert.equal(repairedTransaction?.paymentType, "customer_order");
+  pass("A malformed incomplete transaction is repaired by the verified paid webhook");
+  const duplicateWebhookResult = await sendTrackedWebhook(paidEvent);
+  assert.equal(duplicateWebhookResult.duplicate, true);
+
+  // Simulate an older delivery that settled the order but left a malformed
+  // ledger row. A signed replay must repair the ledger without a second charge
+  // or a second order transition.
+  await db.collection("stripeEvents").deleteOne({ _id: paidEventId });
+  await db.collection("transactions").updateOne(
+    { stripeEventId: paidEventId },
+    {
+      $set: {
+        paymentType: "vendor_subscription",
+        orderId: null,
+        status: "incomplete",
+        paymentStatus: "pending",
+      },
+      $unset: { stripeSessionId: "", stripePaymentIntentId: "" },
+    },
+  );
+  const replayResult = await sendTrackedWebhook(paidEvent);
+  assert.equal(replayResult.processed, true, JSON.stringify(replayResult));
+  const replayedTransaction = await db
+    .collection("transactions")
+    .findOne({ stripeEventId: paidEventId });
+  assert.equal(replayedTransaction?.orderId, paidCheckout.order.id);
+  assert.equal(replayedTransaction?.status, "paid");
+  assert.equal(replayedTransaction?.paymentType, "customer_order");
+  assert.equal(replayedTransaction?.stripePaymentIntentId, paidIntentId);
+  pass("A signed replay repairs a malformed ledger row without a duplicate payment");
+
+  const afterPaid = await api(
+    "customer",
+    "GET",
+    `/api/payments/session/${paidCheckout.sessionId}`,
+  );
+  assert.equal(afterPaid.paymentStatus, "paid");
+  assert.equal(afterPaid.order.stripePaymentIntentId, paidIntentId);
+  const clearedAfterPaid = await api("customer", "GET", "/api/cart");
+  assert.equal(clearedAfterPaid.cart.items.length, 0);
+  pass("Verified paid webhook marks the order paid, stores the PaymentIntent, and clears the cart once");
+
+  const orderTransactionPage = await api(
+    "admin",
+    "GET",
+    `/api/admin/transactions?type=customer_order&search=${paidCheckout.order.id}&limit=50`,
+  );
+  assert.equal(orderTransactionPage.pagination.total, 1);
+  const orderTransaction = orderTransactionPage.transactions[0];
+  assert.equal(orderTransaction.paymentType, "customer_order");
+  assert.equal(orderTransaction.paymentStatus, "paid");
+  assert.equal(orderTransaction.stripeSessionId, paidCheckout.sessionId);
+  assert.equal(orderTransaction.stripePaymentIntentId, paidIntentId);
+  assert.equal(orderTransaction.amount, 37.49);
+  assert.equal(orderTransaction.refundedAmount, 0);
+
+  const myPayments = await api("customer", "GET", "/api/payments/my?type=customer_order");
+  assert.ok(myPayments.transactions.some((entry) => entry.id === orderTransaction.id));
+  const vendorPayments = await api(
+    "vendor",
+    "GET",
+    "/api/payments/vendor?type=customer_order",
+  );
+  assert.ok(vendorPayments.transactions.some((entry) => entry.id === orderTransaction.id));
+  const otherCustomerPayments = await api("otherCustomer", "GET", "/api/payments/my");
+  assert.ok(!otherCustomerPayments.transactions.some((entry) => entry.id === orderTransaction.id));
+  await api(
+    "otherCustomer",
+    "GET",
+    `/api/payments/session/${paidCheckout.sessionId}`,
+    undefined,
+    404,
+  );
+  await api("admin", "GET", `/api/payments/session/${paidCheckout.sessionId}`);
+  await api("customer", "GET", `/api/payments/${orderTransaction.id}`);
+  await api("vendor", "GET", `/api/payments/${orderTransaction.id}`);
+  await api("admin", "GET", `/api/payments/${orderTransaction.id}`);
+  await api(
+    "otherCustomer",
+    "GET",
+    `/api/payments/${orderTransaction.id}`,
+    undefined,
+    403,
+  );
+  await api("admin", "GET", "/api/payments/not-an-object-id", undefined, 404);
+  pass("Payment lists and details enforce customer, vendor, and admin ownership boundaries");
+
+  await api("customer", "POST", "/api/cart", { menuItemId: itemIds[0], quantity: 1 });
+  const paidConflict = await api(
+    "customer",
+    "POST",
+    "/api/payments/checkout",
+    checkoutPayload(paidKey),
+    409,
+  );
+  assert.equal(paidConflict.message, "This checkout has already been paid");
+  await api("customer", "DELETE", "/api/cart");
+  pass("A paid idempotency key cannot start a second charge");
+
+  const partialRefundCents = Math.floor(paidAmountCents / 4);
+  const partialRefundAmount = partialRefundCents / 100;
+  const refundEventId = `evt_it_order_refund_${suffix}`;
+  await sendTrackedWebhook(
+    eventEnvelope(refundEventId, "charge.refunded", {
+      id: `ch_it_order_${suffix}`,
+      object: "charge",
+      payment_intent: paidIntentId,
+      currency: "usd",
+      amount_refunded: partialRefundCents,
+      refunds: {
+        object: "list",
+        data: [
+          {
+            id: `re_it_partial_${suffix}`,
+            object: "refund",
+            amount: partialRefundCents,
+            currency: "usd",
+            reason: "requested_by_customer",
+          },
+        ],
+      },
+    }),
+  );
+  const afterPartialRefund = await api(
+    "admin",
+    "GET",
+    `/api/admin/transactions/${orderTransaction.id}`,
+  );
+  assert.equal(afterPartialRefund.transaction.paymentStatus, "paid");
+  assert.equal(afterPartialRefund.transaction.refundedAmount, partialRefundAmount);
+  assert.equal(afterPartialRefund.transaction.refunds.length, 1);
+  const orderAfterPartialRefund = await api(
+    "customer",
+    "GET",
+    `/api/orders/${paidCheckout.order.id}`,
+  );
+  assert.equal(orderAfterPartialRefund.order.paymentStatus, "paid");
+  pass("A verified partial refund is recorded without changing the paid status");
+
+  await api(
+    "customer",
+    "POST",
+    `/api/admin/transactions/${orderTransaction.id}/refund`,
+    { reason: "not allowed" },
+    403,
+  );
+  await api(
+    "vendor",
+    "POST",
+    `/api/admin/transactions/${orderTransaction.id}/refund`,
+    { reason: "not allowed" },
+    403,
+  );
+  const invalidRefund = await api(
+    "admin",
+    "POST",
+    `/api/admin/transactions/${orderTransaction.id}/refund`,
+    { amount: 9999 },
+    400,
+  );
+  assert.match(invalidRefund.message, /Refund amount must be between/);
+
+  const remainingRefundAmount =
+    Math.round((orderTransaction.amount - partialRefundAmount) * 100) / 100;
+  const fullRefund = await api(
+    "admin",
+    "POST",
+    `/api/admin/transactions/${orderTransaction.id}/refund`,
+    { amount: remainingRefundAmount, reason: "Integration test refund" },
+  );
+  assert.equal(fullRefund.message, "Refund issued");
+  assert.equal(fullRefund.transaction.paymentStatus, "refunded");
+  assert.equal(fullRefund.transaction.refundedAmount, orderTransaction.amount);
+  assert.equal(fullRefund.transaction.refunds.length, 2);
+  const duplicateRefund = await api(
+    "admin",
+    "POST",
+    `/api/admin/transactions/${orderTransaction.id}/refund`,
+    { amount: 0.01 },
+    409,
+  );
+  assert.equal(duplicateRefund.message, "This payment has already been fully refunded");
+  const afterFullRefund = await api(
+    "customer",
+    "GET",
+    `/api/payments/session/${paidCheckout.sessionId}`,
+  );
+  assert.equal(afterFullRefund.paymentStatus, "refunded");
+  pass("Only admins can refund; Stripe refunds are deduped and full refunds update order status");
+
+  const subscriptionRows = await api(
+    "admin",
+    "GET",
+    "/api/admin/transactions?type=vendor_subscription&limit=50",
+  );
+  assert.ok(subscriptionRows.pagination.total >= 1);
+  assert.ok(
+    subscriptionRows.transactions.every(
+      (entry) => entry.paymentType === "vendor_subscription",
+    ),
+  );
+  const subscriptionRefund = await api(
+    "admin",
+    "POST",
+    `/api/admin/transactions/${subscriptionRows.transactions[0].id}/refund`,
+    {},
+    409,
+  );
+  assert.equal(
+    subscriptionRefund.message,
+    "Only customer order payments can be refunded here",
+  );
+  pass("Vendor subscription payments remain isolated from customer order payments and refunds");
+
+  const asyncFailedCheckout = await startCheckout(
+    itemIds[0],
+    1,
+    `async-failed-${suffix}`,
+  );
+  const asyncFailedEventId = `evt_it_order_async_failed_${suffix}`;
+  await sendTrackedWebhook(
+    eventEnvelope(
+      asyncFailedEventId,
+      "checkout.session.async_payment_failed",
+      customerSessionObject({
+        sessionId: asyncFailedCheckout.sessionId,
+        order: asyncFailedCheckout.order,
+        status: "open",
+        paymentStatus: "unpaid",
+        paymentIntentId: `pi_it_async_failed_${suffix}`,
+      }),
+    ),
+  );
+  const asyncFailedTransactionPage = await api(
+    "admin",
+    "GET",
+    `/api/admin/transactions?search=${asyncFailedCheckout.order.id}&limit=50`,
+  );
+  assert.equal(asyncFailedTransactionPage.pagination.total, 1);
+  assert.equal(asyncFailedTransactionPage.transactions[0].paymentStatus, "failed");
+  const asyncFailedSession = await api(
+    "customer",
+    "GET",
+    `/api/payments/session/${asyncFailedCheckout.sessionId}`,
+  );
+  assert.equal(asyncFailedSession.paymentStatus, "failed");
+  pass("checkout.session.async_payment_failed records a failed payment without changing order fulfilment");
+
+  const intentFailedCheckout = await startCheckout(
+    itemIds[1],
+    1,
+    `intent-failed-${suffix}`,
+  );
+  const failedIntentId = `pi_it_failed_${suffix}`;
+  const intentFailedEventId = `evt_it_order_intent_failed_${suffix}`;
+  await sendTrackedWebhook(
+    eventEnvelope(intentFailedEventId, "payment_intent.payment_failed", {
+      id: failedIntentId,
+      object: "payment_intent",
+      status: "requires_payment_method",
+      amount: Math.round(intentFailedCheckout.order.totalAmount * 100),
+      currency: "usd",
+      metadata: orderWebhookMetadata(intentFailedCheckout.order),
+    }),
+  );
+  const intentFailedTransactionPage = await api(
+    "admin",
+    "GET",
+    `/api/admin/transactions?status=failed&type=customer_order&search=${intentFailedCheckout.order.id}&limit=50`,
+  );
+  assert.equal(intentFailedTransactionPage.pagination.total, 1);
+  assert.equal(
+    intentFailedTransactionPage.transactions[0].stripePaymentIntentId,
+    failedIntentId,
+  );
+  pass("payment_intent.payment_failed is handled as a separate webhook event");
+
+  const expiredCheckout = await startCheckout(itemIds[2], 1, `expired-${suffix}`);
+  const expiredEventId = `evt_it_order_expired_${suffix}`;
+  await sendTrackedWebhook(
+    eventEnvelope(
+      expiredEventId,
+      "checkout.session.expired",
+      customerSessionObject({
+        sessionId: expiredCheckout.sessionId,
+        order: expiredCheckout.order,
+        status: "expired",
+        paymentStatus: "unpaid",
+      }),
+    ),
+  );
+  const expiredOrder = await db
+    .collection("orders")
+    .findOne({ _id: new ObjectId(expiredCheckout.order.id) });
+  assert.equal(expiredOrder.paymentStatus, "failed");
+  assert.equal(expiredOrder.checkoutIdempotencyKey, undefined);
+  assert.equal(expiredOrder.checkoutCartKey, undefined);
+  pass("checkout.session.expired marks the order failed and releases both checkout guards");
+
+  // Retrying the same browser key after expiry must not replay Stripe's old
+  // 24-hour idempotency result; the order id is part of the Stripe key.
+  const retriedAfterExpiry = await api(
+    "customer",
+    "POST",
+    "/api/payments/checkout",
+    checkoutPayload(`expired-${suffix}`),
+    201,
+  );
+  checkoutSessionIds.push(retriedAfterExpiry.sessionId);
+  checkoutOrderIds.push(retriedAfterExpiry.order.id);
+  assert.notEqual(retriedAfterExpiry.order.id, expiredCheckout.order.id);
+  assert.notEqual(retriedAfterExpiry.sessionId, expiredCheckout.sessionId);
+  pass("An expired checkout can be retried with the same client key without replaying a stale Session");
+
+  const asyncPaidCheckout = await startCheckout(itemIds[0], 1, `async-paid-${suffix}`);
+  const asyncPaidAmountCents = Math.round(asyncPaidCheckout.order.totalAmount * 100);
+  const asyncPaidIntentId = await createSucceededPaymentIntent(
+    asyncPaidAmountCents,
+    `async-paid-${suffix}`,
+  );
+  const asyncPaidEventId = `evt_it_order_async_paid_${suffix}`;
+  await sendTrackedWebhook(
+    eventEnvelope(
+      asyncPaidEventId,
+      "checkout.session.async_payment_succeeded",
+      customerSessionObject({
+        sessionId: asyncPaidCheckout.sessionId,
+        order: asyncPaidCheckout.order,
+        status: "complete",
+        paymentStatus: "paid",
+        paymentIntentId: asyncPaidIntentId,
+      }),
+    ),
+  );
+  const asyncPaidSession = await api(
+    "customer",
+    "GET",
+    `/api/payments/session/${asyncPaidCheckout.sessionId}`,
+  );
+  assert.equal(asyncPaidSession.paymentStatus, "paid");
+  pass("checkout.session.async_payment_succeeded marks an order paid only with a succeeded PaymentIntent");
+
+  const processingEventId = `evt_it_processing_${suffix}`;
+  webhookEventIds.push(processingEventId);
+  await db.collection("stripeEvents").insertOne({
+    _id: processingEventId,
+    type: "payment_intent.created",
+    vendorId: null,
+    status: "processing",
+    createdAt: new Date(),
+  });
+  const processingDelivery = await sendWebhook(
+    eventEnvelope(processingEventId, "payment_intent.created", {
+      id: `pi_it_processing_${suffix}`,
+      object: "payment_intent",
+    }),
+  );
+  assert.equal(processingDelivery.response.status, 409);
+  assert.equal(processingDelivery.data.retry, true);
+  pass("A concurrent webhook delivery receives a retryable response while one is processing");
+
+  const staleClaimEventId = `evt_it_stale_processing_${suffix}`;
+  webhookEventIds.push(staleClaimEventId);
+  await db.collection("stripeEvents").insertOne({
+    _id: staleClaimEventId,
+    type: "payment_intent.created",
+    vendorId: null,
+    status: "processing",
+    createdAt: new Date(Date.now() - 2 * 60 * 1000),
+  });
+  const staleDelivery = await sendWebhook(
+    eventEnvelope(staleClaimEventId, "payment_intent.created", {
+      id: `pi_it_stale_${suffix}`,
+      object: "payment_intent",
+    }),
+  );
+  assert.equal(staleDelivery.response.status, 200, JSON.stringify(staleDelivery.data));
+  const claimedStaleEvent = await db
+    .collection("stripeEvents")
+    .findOne({ _id: staleClaimEventId });
+  assert.equal(claimedStaleEvent?.status, "processed");
+  pass("A stale processing claim is reclaimed and reaches a terminal state");
+
+  const finalStats = await api("admin", "GET", "/api/admin/stats");
+  assert.ok(finalStats.stats.totalOrderPayments >= 2);
+  assert.ok(finalStats.stats.orderPaymentRevenue >= orderTransaction.amount);
+  pass("Admin stats include centralized customer order payments and revenue");
+
   console.log("\nAll integration checks passed.");
 } finally {
   if (cleanupIds.length) {
@@ -2136,13 +3035,22 @@ try {
       }),
       db.collection("favorites").deleteMany({ customerId: { $in: cleanupIds } }),
       db.collection("reviews").deleteMany({ customerId: { $in: cleanupIds } }),
+      db.collection("carts").deleteMany({
+        $or: [
+          { _id: { $in: cleanupIds } },
+          { customerId: { $in: cleanupIds } },
+        ],
+      }),
       db.collection("checkoutLocks").deleteMany({ _id: { $in: cleanupIds } }),
       db.collection("stripeEvents").deleteMany({ _id: { $in: webhookEventIds } }),
       db.collection("subscriptionEvents").deleteMany({
         stripeEventId: { $in: webhookEventIds },
       }),
       db.collection("transactions").deleteMany({
-        stripeEventId: { $in: webhookEventIds },
+        $or: [
+          { stripeEventId: { $in: webhookEventIds } },
+          { orderId: { $in: checkoutOrderIds } },
+        ],
       }),
     ]);
     console.log("Test data cleaned up.");

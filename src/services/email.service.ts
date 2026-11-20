@@ -40,6 +40,29 @@ export type NewOrderEmailResults = {
   customer: EmailResult;
 };
 
+export type PaymentEmailInput = {
+  vendorEmail: string;
+  vendorName: string;
+  customerEmail: string;
+  customerName: string;
+  orderNumber: string;
+  itemSummary: string;
+  restaurantName?: string | null;
+  amount: number;
+  currency?: string | null;
+  paymentIntentId?: string | null;
+};
+
+export type PaymentNoticeInput = {
+  to: string;
+  customerName: string;
+  orderNumber: string;
+  itemSummary: string;
+  amount: number;
+  currency?: string | null;
+  reason?: string | null;
+};
+
 type OutboundEmail = {
   to: string;
   subject: string;
@@ -266,5 +289,133 @@ export const sendOrderStatusEmail = async (
     subject: copy.subject,
     html,
     text,
+  });
+};
+
+const paymentAmount = (amount: number, currency?: string | null): string => {
+  const code = currency?.toUpperCase() ?? "USD";
+  try {
+    return new Intl.NumberFormat("en-US", {
+      style: "currency",
+      currency: code,
+    }).format(amount);
+  } catch {
+    return `${code} ${amount.toFixed(2)}`;
+  }
+};
+
+/**
+ * Sent only after a verified Stripe webhook marks the order paid. No payment
+ * email is sent from the success page or from checkout creation.
+ */
+export const sendPaidOrderEmails = async (
+  input: PaymentEmailInput,
+): Promise<NewOrderEmailResults> => {
+  const total = paymentAmount(input.amount, input.currency);
+  const restaurant = input.restaurantName
+    ? ` from ${escapeHtml(input.restaurantName)}`
+    : "";
+  const restaurantText = input.restaurantName
+    ? ` from ${input.restaurantName}`
+    : "";
+  const reference = input.paymentIntentId
+    ? ` Payment reference: ${escapeHtml(input.paymentIntentId)}.`
+    : "";
+
+  const [vendor, customer] = await Promise.all([
+    sendEmail("paid-order vendor", {
+      to: input.vendorEmail,
+      subject: `PizzaHub order ${input.orderNumber} paid`,
+      html: layout("Order paid", [
+        `Hi ${escapeHtml(input.vendorName)},`,
+        `Payment was received for order <strong>${escapeHtml(input.orderNumber)}</strong>${restaurant}.`,
+        `${escapeHtml(input.itemSummary)} · Total ${escapeHtml(total)}`,
+        `Customer: ${escapeHtml(input.customerName)} (${escapeHtml(input.customerEmail)})`,
+        "The order now follows the normal restaurant workflow.",
+      ]),
+      text: [
+        "Order paid",
+        `Hi ${input.vendorName},`,
+        `Payment was received for order ${input.orderNumber}${restaurantText}.`,
+        `${input.itemSummary} · Total ${total}`,
+        `Customer: ${input.customerName} (${input.customerEmail})`,
+        "The order now follows the normal restaurant workflow.",
+        "Thanks for choosing PizzaHub.",
+      ].join("\n"),
+    }),
+    sendEmail("paid-order customer", {
+      to: input.customerEmail,
+      subject: `Payment received for PizzaHub order ${input.orderNumber}`,
+      html: layout("Payment received", [
+        `Hi ${escapeHtml(input.customerName)},`,
+        `We received your ${escapeHtml(total)} payment for order <strong>${escapeHtml(input.orderNumber)}</strong>${restaurant}.`,
+        escapeHtml(input.itemSummary),
+        `${reference}`,
+        "We'll email you when the restaurant accepts your order.",
+      ]),
+      text: [
+        "Payment received",
+        `Hi ${input.customerName},`,
+        `We received your ${total} payment for order ${input.orderNumber}${restaurantText}.`,
+        input.itemSummary,
+        reference.trim(),
+        "We'll email you when the restaurant accepts your order.",
+        "Thanks for choosing PizzaHub.",
+      ]
+        .filter(Boolean)
+        .join("\n"),
+    }),
+  ]);
+
+  return { vendor, customer };
+};
+
+/** Notifies the customer after a verified payment failure event. */
+export const sendPaymentFailedEmail = async (
+  input: PaymentNoticeInput,
+): Promise<EmailResult> => {
+  const total = paymentAmount(input.amount, input.currency);
+  return sendEmail("payment failed", {
+    to: input.to,
+    subject: `Payment failed for PizzaHub order ${input.orderNumber}`,
+    html: layout("Payment failed", [
+      `Hi ${escapeHtml(input.customerName)},`,
+      `We could not complete your ${escapeHtml(total)} payment for order <strong>${escapeHtml(input.orderNumber)}</strong>.`,
+      escapeHtml(input.itemSummary),
+      "No order has been confirmed. You can start a new checkout to try again.",
+    ]),
+    text: [
+      "Payment failed",
+      `Hi ${input.customerName},`,
+      `We could not complete your ${total} payment for order ${input.orderNumber}.`,
+      input.itemSummary,
+      "No order has been confirmed. You can start a new checkout to try again.",
+    ].join("\n"),
+  });
+};
+
+/** Notifies the customer after a verified Stripe refund. */
+export const sendRefundEmail = async (
+  input: PaymentNoticeInput,
+): Promise<EmailResult> => {
+  const total = paymentAmount(input.amount, input.currency);
+  return sendEmail("payment refunded", {
+    to: input.to,
+    subject: `Refund issued for PizzaHub order ${input.orderNumber}`,
+    html: layout("Refund issued", [
+      `Hi ${escapeHtml(input.customerName)},`,
+      `A refund of ${escapeHtml(total)} was issued for order <strong>${escapeHtml(input.orderNumber)}</strong>.`,
+      escapeHtml(input.itemSummary),
+      ...(input.reason ? [`Reason: ${escapeHtml(input.reason)}`] : []),
+      "Depending on your bank, the refund can take several business days to appear.",
+    ]),
+    text: [
+      "Refund issued",
+      `Hi ${input.customerName},`,
+      `A refund of ${total} was issued for order ${input.orderNumber}.`,
+      input.itemSummary,
+      ...(input.reason ? [`Reason: ${input.reason}`] : []),
+      "Depending on your bank, the refund can take several business days to appear.",
+    ].join("\n"),
   });
 };
