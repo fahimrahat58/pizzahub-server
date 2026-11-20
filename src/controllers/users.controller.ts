@@ -110,10 +110,14 @@ export const adminListUsers = asyncHandler(async (req: Request, res: Response) =
   const { page, limit } = getPagination(req);
   const search = adminSearchPattern(firstString(req.query.search));
   const role = firstString(req.query.role);
+  const status = firstString(req.query.status);
 
-  const filter = {
+  const filter: Document = {
     ...(role && ["customer", "vendor", "admin"].includes(role)
       ? { role: role as UserDoc["role"] }
+      : {}),
+    ...(status === "active" || status === "blocked"
+      ? { isBlocked: status === "blocked" ? true : { $in: [false, null] } }
       : {}),
     ...(search
       ? {
